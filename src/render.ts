@@ -108,15 +108,18 @@ const EVENT_INTENT: Record<string, string> = {
 /**
  * Render one delegate-authored event as a supervisor notice.
  *
- * The delegate cannot be steered in place today, so a notice states the two
- * things a supervisor can actually do with it — act on the information, or
- * cancel and re-delegate — rather than implying a reply channel that does not
- * exist.
+ * A wake-urgency report is a delegation asking for something, so the notice
+ * has to name the action that answers it — and which action that is depends on
+ * the provider. Where steering exists, redirecting in place keeps the
+ * delegation's id, session, and budget, so it leads and the destructive path is
+ * the fallback. Where it does not, cancel-and-re-delegate is the only honest
+ * advice and stays the whole of it.
  * @param event - the bounded, projected event.
  * @param maxBodyBytes - byte budget for the complete notice body.
+ * @param canSteer - whether the mounted provider can redirect a running delegation.
  * @returns the bounded summary and body.
  */
-export function renderDelegationEvent(event: DelegationEvent, maxBodyBytes: number): DelegationEventNotice {
+export function renderDelegationEvent(event: DelegationEvent, maxBodyBytes: number, canSteer: boolean): DelegationEventNotice {
   const headline = `Delegate job ${event.jobId} reported: ${event.type}`
   const firstLine = event.message.split('\n')[0] ?? ''
   const sections = [
@@ -124,8 +127,12 @@ export function renderDelegationEvent(event: DelegationEvent, maxBodyBytes: numb
     frameDelegateText(event.jobId, `${event.type} report`, eventPayload(event)),
   ]
   if (event.urgency === 'wake') {
-    sections.push(`This delegation cannot be redirected in place: act on the report, or stop it with job_kill and `
-      + `delegate again with the corrected prompt. Read its transcript with delegate_logs ${event.jobId}.`)
+    sections.push(canSteer
+      ? `Answer it with delegate_steer ${event.jobId}: your guidance interrupts the current turn and continues the same `
+        + `delegation, which keeps its id and its budget. If the steer comes back refused or unsupported, stop it with `
+        + `job_kill and delegate again with the answer written into the new prompt. Transcript: delegate_logs ${event.jobId}.`
+      : `This delegation cannot be redirected in place: act on the report, or stop it with job_kill and `
+        + `delegate again with the corrected prompt. Read its transcript with delegate_logs ${event.jobId}.`)
   }
   const body = sections.join('\n\n')
   const bounded = Buffer.byteLength(body, 'utf8') <= maxBodyBytes ? body : boundNoticeBody(body, maxBodyBytes)

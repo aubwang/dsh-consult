@@ -230,13 +230,13 @@ export function apply(ctx: Context, config: Config = {}): void {
    * next step, so several reports arriving together cost one step rather than
    * one turn each.
    */
-  const deliverEvent = (owner: Agent, event: DelegationEvent): void => {
+  const deliverEvent = (owner: Agent, event: DelegationEvent, canSteer: boolean): void => {
     // `lifecycle` is already announced by dsh-tool-jobs' completion notice, and
     // `steer` is the supervisor's own guidance coming back — notifying it about
     // something it just did is pure noise. Both still appear in events() for
     // inspection.
     if (event.type === 'lifecycle' || event.type === 'steer') return
-    const notice = renderDelegationEvent(event, resolved.outputLimitBytes)
+    const notice = renderDelegationEvent(event, resolved.outputLimitBytes, canSteer)
     try {
       const message = createUserMessage({
         content: [{ type: 'text', text: notice.body }],
@@ -343,6 +343,21 @@ export function apply(ctx: Context, config: Config = {}): void {
   }
 
   /**
+   * Whether the mounted provider can redirect a running delegation, read from
+   * the memoized capability probe. It decides what a wake-urgency notice tells
+   * the supervisor to do, so it is captured once per delegation rather than at
+   * delivery time: the notice must never recommend a tool this composition
+   * cannot serve, and a probe failure is not a reason to fail a delegation.
+   */
+  const steerable = async (options: DelegationCallOptions): Promise<boolean> => {
+    try {
+      return (await ctx.delegation.capabilities(options)).canSteer
+    } catch {
+      return false
+    }
+  }
+
+  /**
    * Publish one delegation as a `ctx.jobs` background job.
    *
    * The delegation already exists on the provider side by the time this runs,
@@ -351,13 +366,13 @@ export function apply(ctx: Context, config: Config = {}): void {
    * service.
    * @returns the dsh job id, or the reason there is none.
    */
-  const track = (job: DelegationJob, exec: ToolRunContext, options: DelegationCallOptions): Tracking => {
+  const track = (job: DelegationJob, exec: ToolRunContext, options: DelegationCallOptions, canSteer: boolean): Tracking => {
     if (!resolved.trackJobs) return { reason: 'background tracking is disabled for this deployment (trackJobs: false)' }
     const jobs = ctx.get('jobs')
     if (jobs === undefined) return { reason: 'no background job service is mounted' }
     const controller = new AbortController()
     try {
-      return { jobId: startTracking(jobs, job, exec, options, controller) }
+      return { jobId: startTracking(jobs, job, exec, options, controller, canSteer) }
     } catch (error) {
       controller.abort()
       return { reason: `background tracking could not start: ${noticeLine(error instanceof Error ? error.message : String(error), 200)}` }
@@ -370,6 +385,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     exec: ToolRunContext,
     options: DelegationCallOptions,
     controller: AbortController,
+    canSteer: boolean,
   ): string => {
     return jobs.start({
       kind: 'delegate',
@@ -384,7 +400,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         const owner = exec.agent
         const unwatch = owner === undefined
           ? () => {}
-          : ctx.delegation.watch(job.id, (event) => deliverEvent(owner, event), detachedOptions(options))
+          : ctx.delegation.watch(job.id, (event) => deliverEvent(owner, event, canSteer), detachedOptions(options))
         const done = collect(job.id, controller, options).finally(() => {
           controller.abort()
           unwatch()
@@ -485,7 +501,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       } catch (error) {
         return toFailure(error)
       }
-      const tracked = track(job, exec, options)
+      const tracked = track(job, exec, options, await steerable(options))
       return {
         kind: 'started' as const,
         job: jobValue(job),
@@ -540,7 +556,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       } catch (error) {
         return toFailure(error)
       }
-      const tracked = track(job, exec, options)
+      const tracked = track(job, exec, options, await steerable(options))
       return {
         kind: 'started' as const,
         job: jobValue(job),

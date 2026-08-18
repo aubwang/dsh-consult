@@ -349,6 +349,30 @@ describe('delegation event delivery', () => {
     assert.match(String((woken?.content[0] as { text: string }).text), /untrusted-delegate-output/)
   })
 
+  it('tells a steer-capable supervisor to redirect in place, not to kill the delegation', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_EVENT_STEP_MS: '20', FAKE_CONSULT_DELAY_MS: '5000' } })
+    const owner = harness.owner('session-advice-steer', { status: 'idle' })
+    await harness.call('delegate', { prompt: 'p' }, owner.agent)
+    const wake = await until(() => owner.followedUp[0])
+    const body = String((wake.content[0] as { text: string }).text)
+    assert.match(body, /Answer it with delegate_steer job-1/)
+    // The destructive path is still named, but as the fallback.
+    assert.ok(body.indexOf('delegate_steer') < body.indexOf('job_kill'), 'steering must lead, killing must follow')
+    assert.match(body, /refused or unsupported/)
+  })
+
+  it('keeps the cancel-and-re-delegate advice when the provider cannot steer', async () => {
+    const harness = await setup({
+      scenario: { FAKE_CONSULT_EVENT_STEP_MS: '20', FAKE_CONSULT_DELAY_MS: '5000', FAKE_CONSULT_NO_STEER: '1' },
+    })
+    const owner = harness.owner('session-advice-nosteer', { status: 'idle' })
+    await harness.call('delegate', { prompt: 'p' }, owner.agent)
+    const wake = await until(() => owner.followedUp[0])
+    const body = String((wake.content[0] as { text: string }).text)
+    assert.match(body, /cannot be redirected in place/)
+    assert.equal(/delegate_steer/.test(body), false, 'never advertise a tool this composition cannot serve')
+  })
+
   it('injects into a busy owner instead of interrupting it', async () => {
     const harness = await setup({ scenario: { FAKE_CONSULT_EVENT_STEP_MS: '20', FAKE_CONSULT_DELAY_MS: '5000' } })
     const owner = harness.owner('session-busy', { status: 'running' })
