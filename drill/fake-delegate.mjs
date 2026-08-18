@@ -11,7 +11,10 @@
  * The scenario, in three beats:
  *
  *  1. FIRST `session/prompt`: emit a chunk, shell out to `consult report --type
- *     blocked`, then leave the turn OPEN. The job id and workspace reach this
+ *     blocked`, then leave the turn OPEN. NOTE: it spawns that subprocess
+ *     itself, never asking the client for permission — which is exactly how a
+ *     real ACP agent differs, and why fake mode cannot prove a real delegate is
+ *     able to report (see the live-dogfood note in the README). The job id and workspace reach this
  *     process automatically through CONSULT_PARENT_JOB / CONSULT_WORKSPACE, and
  *     CONSULT_DATA_DIR is inherited; the consult binary arrives through the
  *     profile record's own `env` as DRILL_CONSULT_BIN.
