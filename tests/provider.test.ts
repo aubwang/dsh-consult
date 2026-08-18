@@ -85,6 +85,8 @@ describe('preflight', () => {
     assert.deepEqual([...capabilities.profiles], ['claude', 'codex'])
     assert.equal(capabilities.defaultProfile, 'claude')
     assert.equal(capabilities.canSteer, true, 'this consult build has the steer command')
+    assert.equal(capabilities.canReview, true)
+    assert.deepEqual(Object.keys(capabilities.extensions).sort(), ['isolated', 'sandbox'])
     assert.equal(capabilities.canReport, true, 'this consult build has the events command')
   })
 
@@ -240,8 +242,16 @@ describe('exit-code mapping through a real spawn', () => {
       error instanceof DelegationError && error.code === 'delegate-failed')
   })
 
-  it('lets a usage error out as an infrastructure failure', async () => {
+  it('reports an unknown job as a typed outcome, not plugin breakage', async () => {
     const harness = await setup({ FAKE_CONSULT_EXIT_STATUS: '2' })
+    await assert.rejects(harness.delegation.status('nope'), (error: unknown) =>
+      error instanceof DelegationError && error.code === 'unknown-job')
+  })
+
+  it('still lets a genuine usage error out as an infrastructure failure', async () => {
+    // Every argv is plugin-authored, so a usage error means the plugin or its
+    // configuration is wrong — not something a supervisor can react to.
+    const harness = await setup({ FAKE_CONSULT_EXIT_STATUS: '2', FAKE_CONSULT_USAGE_STDERR: '1' })
     await assert.rejects(harness.delegation.status('nope'), (error: unknown) =>
       error instanceof Error && !(error instanceof DelegationError) && /exit 2/.test(error.message))
   })
@@ -408,10 +418,10 @@ describe('events()', () => {
     assert.deepEqual(argv?.slice(-2), ['--since', '2'])
   })
 
-  it('maps an unknown job to the infrastructure failure consult reports', async () => {
+  it('maps an unknown job to the typed unknown-job outcome', async () => {
     const harness = await setup({ FAKE_CONSULT_EXIT_EVENTS: '2' })
     await assert.rejects(harness.delegation.events('nope'), (error: unknown) =>
-      error instanceof Error && !(error instanceof DelegationError))
+      error instanceof DelegationError && error.code === 'unknown-job')
   })
 })
 
@@ -565,10 +575,10 @@ describe('steer()', () => {
     assert.match((outcome as { detail?: string }).detail ?? '', /already finalized/)
   })
 
-  it('lets an unknown job out as an infrastructure failure', async () => {
+  it('reports an unknown job as a typed outcome', async () => {
     const harness = await setup({ FAKE_CONSULT_EXIT_STEER: '2' })
     await assert.rejects(harness.delegation.steer('nope', 'go left'), (error: unknown) =>
-      error instanceof Error && !(error instanceof DelegationError))
+      error instanceof DelegationError && error.code === 'unknown-job')
   })
 
   it('rejects oversized guidance before spawning anything', async () => {

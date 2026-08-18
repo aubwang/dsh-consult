@@ -162,7 +162,7 @@ try {
   const bodyOf = (message) => message.content.map((block) => block.text ?? '').join('\n')
 
   const capabilities = await ctx.delegation.capabilities()
-  say(`consult ${capabilities.version ?? 'unknown'}  ready=${capabilities.ready}  canReport=${capabilities.canReport}  canSteer=${capabilities.canSteer}`)
+  say(`consult ${capabilities.version ?? 'unknown'}  ready=${capabilities.ready}  canReport=${capabilities.canReport}  canSteer=${capabilities.canSteer}  extensions=${Object.keys(capabilities.extensions).join(',')}`)
   check(capabilities.ready, `consult is not ready: ${capabilities.diagnosis ?? 'no diagnosis'}`)
   check(capabilities.canReport, 'this consult has no `events` command; the drill needs report/events/steer')
   check(capabilities.canSteer, 'this consult has no `steer` command; the drill needs report/events/steer')
@@ -173,7 +173,9 @@ try {
   const started = await callTool('delegate', {
     prompt: 'Investigate the retry policy in src/. Report back when you need a decision.',
     label: 'full-loop drill',
-    sandbox: 'inherit',
+    // Confinement is provider-specific, so it travels in the extensions bag
+    // rather than as a standard spec field (seam v2).
+    extensions: { sandbox: 'inherit' },
   })
   check(!started.isError, `delegate failed: ${JSON.stringify(started.error)}`)
   check(started.value.kind === 'started', `delegate returned ${JSON.stringify(started.value)}`)
