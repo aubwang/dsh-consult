@@ -38,7 +38,7 @@
  *   FAKE_CONSULT_RECORD         JSONL file every invocation is appended to (argv + consult env)
  */
 
-import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 
 const argv = process.argv.slice(2)
 const command = argv[0] ?? ''
@@ -345,18 +345,34 @@ function forcedExit(name, count) {
   return Number(code)
 }
 
+/**
+ * Bump one invocation counter in the shared state file.
+ *
+ * The provider probes several subcommands CONCURRENTLY, so two of these
+ * processes can read-modify-write this file at the same time. A plain
+ * write is not enough: a concurrent reader can observe a half-written file and
+ * silently reset every counter, which made scenarios keyed on "the first call"
+ * fire twice. The write goes through a unique temp file and an atomic rename,
+ * and the read retries once, so an interleaving can lose an increment but can
+ * never resurrect a spent one.
+ */
 function bumpCounter(name) {
   const path = process.env.FAKE_CONSULT_STATE
   if (path === undefined) return 1
   let state = {}
-  try {
-    state = JSON.parse(readFileSync(path, 'utf8'))
-  } catch {
-    state = {}
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      state = JSON.parse(readFileSync(path, 'utf8'))
+      break
+    } catch {
+      state = {}
+    }
   }
   const next = (state[name] ?? 0) + 1
   state[name] = next
-  writeFileSync(path, JSON.stringify(state))
+  const staging = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}`
+  writeFileSync(staging, JSON.stringify(state))
+  renameSync(staging, path)
   return next
 }
 
