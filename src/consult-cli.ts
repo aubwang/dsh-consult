@@ -24,8 +24,8 @@ import {
   type DelegationLifecycle,
   type DelegationLineage,
   type DelegationMode,
+  type DelegationExtensions,
   type DelegationResult,
-  type DelegationSandbox,
   type DelegationStatus,
   type ReviewSpec,
   type SteerOutcome,
@@ -300,13 +300,15 @@ export function projectJob(envelope: JobEnvelope): DelegationJob {
   const kind = stringOf(job.kind)
   const submittedAt = stringOf(job.submittedAt)
   const finishedAt = stringOf(job.completedAt)
+  const profile = stringOf(job.profile)
+  const mode = projectMode(job)
   return {
     id,
     status,
     ...status === 'unknown' && rawStatus !== undefined ? { rawStatus } : {},
     ...label !== undefined ? { label } : {},
-    profile: stringOf(job.profile) ?? 'unknown',
-    mode: projectMode(job),
+    ...profile !== undefined ? { profile } : {},
+    ...mode !== undefined ? { mode } : {},
     ...kind !== undefined ? { kind } : {},
     ...submittedAt !== undefined ? { submittedAt } : {},
     ...finishedAt !== undefined ? { finishedAt } : {},
@@ -336,18 +338,70 @@ export function projectResult(envelope: JobEnvelope, maxTextBytes: number): Dele
   }
 }
 
+/**
+ * Confinement values consult accepts. Not a seam concept — it left
+ * {@link DelegateSpec} in seam v2 and now travels as a provider extension.
+ */
+export type ConsultSandbox = 'confined' | 'inherit'
+
+/** The extension keys this provider understands, with the descriptions it advertises. */
+export const CONSULT_EXTENSIONS: Record<string, { description: string }> = {
+  sandbox: { description: "'confined' (default) runs the delegate under consult's OS boundary; 'inherit' removes it and grants ambient host authority." },
+  isolated: { description: 'true runs a write delegation in a detached git worktree and returns a patch instead of touching the checkout.' },
+}
+
+/** One spec's extensions, validated against what this provider understands. */
+export interface ConsultExtensionValues {
+  sandbox?: ConsultSandbox
+  isolated?: boolean
+}
+
+/**
+ * Read and validate the provider-interpreted options off a spec.
+ *
+ * An unrecognized key is REJECTED rather than ignored: a supervisor that
+ * misspells `isolated` must not be told its delegation was isolated when it was
+ * not, and the same argument covers every future key.
+ * @param extensions - the spec's extension bag.
+ * @returns the validated values this provider understands.
+ * @throws DelegationError `unsupported` for an unknown key or a malformed value.
+ */
+export function readConsultExtensions(extensions: DelegationExtensions | undefined): ConsultExtensionValues {
+  if (extensions === undefined) return {}
+  const values: ConsultExtensionValues = {}
+  for (const [key, value] of Object.entries(extensions)) {
+    if (key === 'sandbox') {
+      if (value !== 'confined' && value !== 'inherit') {
+        throw new DelegationError('unsupported', `extension "sandbox" must be "confined" or "inherit", got ${JSON.stringify(value)}`)
+      }
+      values.sandbox = value
+      continue
+    }
+    if (key === 'isolated') {
+      if (typeof value !== 'boolean') {
+        throw new DelegationError('unsupported', `extension "isolated" must be a boolean, got ${JSON.stringify(value)}`)
+      }
+      values.isolated = value
+      continue
+    }
+    throw new DelegationError('unsupported', `unknown delegation extension ${JSON.stringify(key)}; this provider accepts ${Object.keys(CONSULT_EXTENSIONS).join(', ')}`)
+  }
+  return values
+}
+
 /** Build `consult delegate` arguments from a seam spec. Always background, always `--json`. */
-export function delegateArgs(spec: DelegateSpec, defaults: { mode: DelegationMode; sandbox: DelegationSandbox; profile?: string | undefined }): string[] {
+export function delegateArgs(spec: DelegateSpec, defaults: { mode: DelegationMode; sandbox: ConsultSandbox; profile?: string | undefined }): string[] {
   const mode = spec.mode ?? defaults.mode
+  const extensions = readConsultExtensions(spec.extensions)
   const args = ['delegate', '--background', '--json']
   const profile = spec.profile ?? defaults.profile
   if (profile !== undefined) args.push('--agent', profile)
   args.push(mode === 'write' ? '--write' : '--read-only')
-  if (spec.isolated === true) {
-    if (mode !== 'write') throw new DelegationError('unsupported', 'isolated delegation requires mode "write"')
+  if (extensions.isolated === true) {
+    if (mode !== 'write') throw new DelegationError('unsupported', 'the "isolated" extension requires mode "write"')
     args.push('--isolated')
   }
-  args.push('--sandbox', spec.sandbox ?? defaults.sandbox)
+  args.push('--sandbox', extensions.sandbox ?? defaults.sandbox)
   if (spec.model !== undefined) args.push('--model', spec.model)
   if (spec.effort !== undefined) args.push('--effort', spec.effort)
   if (spec.label !== undefined) args.push('--label', spec.label)
@@ -357,16 +411,20 @@ export function delegateArgs(spec: DelegateSpec, defaults: { mode: DelegationMod
 }
 
 /** Build `consult review` arguments from a seam spec. Always background, always `--json`. */
-export function reviewArgs(spec: ReviewSpec, defaults: { sandbox: DelegationSandbox; profile?: string | undefined }): string[] {
+export function reviewArgs(spec: ReviewSpec, defaults: { sandbox: ConsultSandbox; profile?: string | undefined }): string[] {
   if (spec.base !== undefined && spec.jobId !== undefined) {
     throw new DelegationError('unsupported', 'review accepts either a base ref or a job id, not both')
+  }
+  const extensions = readConsultExtensions(spec.extensions)
+  if (extensions.isolated !== undefined) {
+    throw new DelegationError('unsupported', 'the "isolated" extension does not apply to a review; reviews are always read-only')
   }
   const args = ['review', '--background', '--json']
   const profile = spec.profile ?? defaults.profile
   if (profile !== undefined) args.push('--agent', profile)
   if (spec.base !== undefined) args.push('--base', spec.base)
   if (spec.jobId !== undefined) args.push('--job', spec.jobId)
-  args.push('--sandbox', spec.sandbox ?? defaults.sandbox)
+  args.push('--sandbox', extensions.sandbox ?? defaults.sandbox)
   if (spec.model !== undefined) args.push('--model', spec.model)
   if (spec.effort !== undefined) args.push('--effort', spec.effort)
   if (spec.label !== undefined) args.push('--label', spec.label)
@@ -408,6 +466,13 @@ export function mapExit(run: ConsultRun, context: ExitMappingContext): Error | u
   }
   switch (run.exitCode) {
     case CONSULT_EXIT.usage:
+      // consult reports usage errors, configuration errors, and unknown jobs
+      // with one exit code. Only the last is something a supervisor can be
+      // wrong about — every argv here is plugin-authored — so it becomes a
+      // typed outcome and the rest stay infrastructure failures.
+      if (/\bjob not found\b|\bunknown job\b/i.test(detail)) {
+        return new DelegationError('unknown-job', `${where}: no such delegation`, options)
+      }
       return new Error(`${where} failed with a usage or configuration error (exit 2)${detail.length > 0 ? `: ${detail}` : ''}`)
     case CONSULT_EXIT.contention:
       return new DelegationError('busy', `${where} could not proceed: the consult broker is busy or the job payload conflicts (exit 3), and one retry did not clear it`, options)
@@ -666,9 +731,10 @@ function projectStatus(raw: string | undefined): DelegationStatus {
 }
 
 /** Read the authority mode from the envelope's authority block, falling back to the legacy `mode` field. */
-function projectMode(job: Record<string, unknown>): DelegationMode {
+function projectMode(job: Record<string, unknown>): DelegationMode | undefined {
   const authority = isRecord(job.authority) ? job.authority : undefined
   const mode = stringOf(authority?.mode) ?? stringOf(job.mode)
+  if (mode === undefined) return undefined
   return mode === 'write' ? 'write' : 'read-only'
 }
 
