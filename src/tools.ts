@@ -96,8 +96,8 @@ const JOB_PROPERTIES = {
   id: { type: 'string', required: true },
   status: { type: 'string', required: true },
   rawStatus: { type: 'string' },
-  profile: { type: 'string', required: true },
-  mode: { type: 'string', required: true },
+  profile: { type: 'string' },
+  mode: { type: 'string' },
   kind: { type: 'string' },
   label: { type: 'string' },
   submittedAt: { type: 'string' },
@@ -143,8 +143,8 @@ function jobValue(job: DelegationJob) {
     id: job.id,
     status: job.status,
     ...job.rawStatus !== undefined ? { rawStatus: job.rawStatus } : {},
-    profile: job.profile,
-    mode: job.mode,
+    ...job.profile !== undefined ? { profile: job.profile } : {},
+    ...job.mode !== undefined ? { mode: job.mode } : {},
     ...job.kind !== undefined ? { kind: job.kind } : {},
     ...job.label !== undefined ? { label: job.label } : {},
     ...job.submittedAt !== undefined ? { submittedAt: job.submittedAt } : {},
@@ -526,9 +526,15 @@ export function apply(ctx: Context, config: Config = {}): void {
       prompt: { type: 'string', required: true, description: 'The complete cold prompt: objective, acceptance criteria, exact paths, constraints, and expected deliverable.' },
       profile: { type: 'string', description: 'Delegate identity to use. Omit for the configured default.' },
       mode: { type: 'string', enum: ['read-only', 'write'], description: 'Workspace authority. Defaults to read-only; use write only when the task must change files.' },
-      isolated: { type: 'boolean', description: 'With mode "write", run in a detached worktree and return a patch instead of touching the checkout.' },
-      sandbox: { type: 'string', enum: ['confined', 'inherit'], description: 'Confinement. Defaults to the deployment setting; "inherit" removes the OS boundary and grants ambient host authority.' },
       after: { type: 'array', items: { type: 'string' }, description: 'Job ids that must finish first. A failed prerequisite skips this job.' },
+      extensions: {
+        type: 'object',
+        additionalProperties: true,
+        description: 'Options specific to the configured delegation provider, which declares the keys it accepts. '
+          + 'With the usual consult provider: "sandbox" ("confined" default, or "inherit" to remove the OS boundary '
+          + 'and grant ambient host authority) and "isolated" (true, with mode "write", to work in a detached worktree '
+          + 'and return a patch). An unrecognized key is rejected, not ignored.',
+      },
       label: { type: 'string', description: 'Short human label shown in job listings (1-80 characters).' },
       model: { type: 'string', description: 'Model id passed to the delegate.' },
       effort: { type: 'string', description: 'Reasoning-effort level passed to the delegate.' },
@@ -552,9 +558,8 @@ export function apply(ctx: Context, config: Config = {}): void {
         prompt: args.prompt,
         ...args.profile !== undefined ? { profile: args.profile } : {},
         ...args.mode !== undefined ? { mode: args.mode } : {},
-        ...args.isolated !== undefined ? { isolated: args.isolated } : {},
-        ...args.sandbox !== undefined ? { sandbox: args.sandbox } : {},
         ...args.after !== undefined ? { after: args.after } : {},
+        ...args.extensions !== undefined ? { extensions: args.extensions } : {},
         ...args.label !== undefined ? { label: args.label } : {},
         ...args.model !== undefined ? { model: args.model } : {},
         ...args.effort !== undefined ? { effort: args.effort } : {},
@@ -586,8 +591,12 @@ export function apply(ctx: Context, config: Config = {}): void {
       base: { type: 'string', description: 'Git base ref to review the current change against. Mutually exclusive with job_id.' },
       job_id: { type: 'string', description: 'A completed isolated write job whose patch is reviewed. Mutually exclusive with base.' },
       profile: { type: 'string', description: 'Reviewer identity. Omit for the configured default.' },
-      sandbox: { type: 'string', enum: ['confined', 'inherit'], description: 'Confinement. Defaults to the deployment setting.' },
       label: { type: 'string', description: 'Short human label shown in job listings (1-80 characters).' },
+      extensions: {
+        type: 'object',
+        additionalProperties: true,
+        description: 'Options specific to the configured delegation provider. With the usual consult provider: "sandbox".',
+      },
       model: { type: 'string', description: 'Model id passed to the reviewer.' },
       effort: { type: 'string', description: 'Reasoning-effort level; review is a subtle-risk turn, so raise it when the profile allows.' },
     },
@@ -610,14 +619,26 @@ export function apply(ctx: Context, config: Config = {}): void {
         ...args.base !== undefined ? { base: args.base } : {},
         ...args.job_id !== undefined ? { jobId: args.job_id } : {},
         ...args.profile !== undefined ? { profile: args.profile } : {},
-        ...args.sandbox !== undefined ? { sandbox: args.sandbox } : {},
         ...args.label !== undefined ? { label: args.label } : {},
         ...args.model !== undefined ? { model: args.model } : {},
         ...args.effort !== undefined ? { effort: args.effort } : {},
+        ...args.extensions !== undefined ? { extensions: args.extensions } : {},
+      }
+      // Reviewing pins a VCS change, which a provider without a checkout cannot
+      // do; seam v2 made the method optional, so its absence is an outcome the
+      // supervisor reads rather than a crash.
+      const review = ctx.delegation.review?.bind(ctx.delegation)
+      if (review === undefined) {
+        return {
+          kind: 'failure' as const,
+          code: 'review-unsupported',
+          message: 'the configured delegation provider serves no reviews',
+          detail: 'It has no version-controlled workspace to pin a change against. Use delegate with a prompt that asks for a review of specific files instead.',
+        }
       }
       let job: DelegationJob
       try {
-        job = await ctx.delegation.review(spec, options)
+        job = await review(spec, options)
       } catch (error) {
         return toFailure(error)
       }
