@@ -207,8 +207,14 @@ export function apply(ctx: Context, config: Config = {}): void {
   // completion notices, kept as a separate budget because the two answer
   // different questions.
   const spentWakes = new WeakMap<Agent, number>()
-  /** Whether the earlier-sessions announcement has already been made. */
-  let announced = false
+  /**
+   * Supervisors that have already been told about delegations left running by
+   * an earlier session. Keyed by the exact Agent for the same reason the wake
+   * budget is: one plugin context can serve many agents, and "once" has to mean
+   * once per supervisor — a process-wide flag would let whichever agent touched
+   * a delegation tool first permanently silence every other session.
+   */
+  const announcedTo = new WeakSet<Agent>()
   if (resolved.wakeBudget > 0) {
     ctx.on('agent/inbox/claimed', ({ agent, message }) => {
       // Claiming is where human input actually enters a step. A notice this
@@ -376,7 +382,10 @@ export function apply(ctx: Context, config: Config = {}): void {
    * to say is that this session will never notify about them.
    */
   const announceEarlierSessions = async (exec: ToolRunContext, options: DelegationCallOptions): Promise<void> => {
-    if (announced) return
+    // An agent-less execution has nobody to tell, so it neither receives the
+    // announcement nor consumes it on some other agent's behalf.
+    const owner = exec.agent
+    if (owner === undefined || announcedTo.has(owner)) return
     let capabilities
     try {
       capabilities = await ctx.delegation.capabilities(options)
@@ -384,9 +393,9 @@ export function apply(ctx: Context, config: Config = {}): void {
       return
     }
     // Nothing has been reconciled while preflight is failing, so stay quiet and
-    // let a later call announce once the provider comes up.
+    // let a later call from THIS agent announce once the provider comes up.
     if (!capabilities.ready) return
-    announced = true
+    announcedTo.add(owner)
     const active = capabilities.activeFromEarlierSessions ?? 0
     if (active === 0) return
     const plural = active === 1 ? 'delegation' : 'delegations'
