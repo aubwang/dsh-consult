@@ -271,13 +271,12 @@ export class ConsultDelegation extends DelegationService {
           + 'Run `consult doctor` in the workspace, and `consult setup --install <profile>` if no profile is configured.',
       }
     }
+    const defaultProfile = doctor.selectedProfile ?? roster.defaultProfile ?? this.config.defaultProfile
     return {
       ready: true,
       version: gate.version,
       profiles: roster.profiles,
-      ...doctor.selectedProfile ?? roster.defaultProfile ?? this.config.defaultProfile
-        ? { defaultProfile: doctor.selectedProfile ?? roster.defaultProfile ?? this.config.defaultProfile }
-        : {},
+      ...defaultProfile !== undefined ? { defaultProfile } : {},
     }
   }
 

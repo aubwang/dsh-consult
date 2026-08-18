@@ -40,18 +40,6 @@ export type DelegationStatus =
   | 'skipped'
   | 'unknown'
 
-/** Statuses no further work will leave. */
-export const TERMINAL_DELEGATION_STATUSES: readonly DelegationStatus[] = ['completed', 'cancelled', 'failed', 'skipped']
-
-/**
- * Whether a status is terminal.
- * @param status - the projected lifecycle status.
- * @returns true when no further transition is expected.
- */
-export function isTerminalDelegationStatus(status: DelegationStatus): boolean {
-  return TERMINAL_DELEGATION_STATUSES.includes(status)
-}
-
 /** One delegation request: a cold prompt plus the authority it runs under. */
 export interface DelegateSpec {
   /** The complete self-contained prompt; the delegate sees no host conversation. */
