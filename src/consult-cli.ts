@@ -454,7 +454,9 @@ export function boundText(text: string, maxBytes: number, keep: 'head' | 'tail')
  * @returns the bounded tail.
  */
 export function boundLines(text: string, maxLines: number, maxBytes: number): BoundedText {
-  const lines = text.split('\n')
+  // A rendered transcript ends with a newline; that trailing empty element is a
+  // line terminator, not a line, and must not consume the budget.
+  const lines = text.replace(/\n$/, '').split('\n')
   const droppedLines = Math.max(0, lines.length - maxLines)
   const kept = droppedLines === 0 ? text : lines.slice(droppedLines).join('\n')
   const bounded = boundText(kept, maxBytes, 'tail')

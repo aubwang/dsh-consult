@@ -42,7 +42,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "node --test tests/"
+    "test": "node --test"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.0.1",
