@@ -1,0 +1,27 @@
+# Build output
+lib/
+*.tsbuildinfo
+
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Sandbox artifacts dropped into this checkout by the agent harness.
+# They are 3-byte placeholders, not project files; kept on disk, never tracked.
+.bash_profile
+.bashrc
+.gitconfig
+.gitmodules
+.idea
+.vscode
+.zshrc
+.zprofile
+.profile
+.ripgreprc
+.mcp.json
+.claude/
+.codex/
+
+# Local scratch
+*.log
+.DS_Store

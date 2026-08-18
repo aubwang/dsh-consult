@@ -1,0 +1,23 @@
+# The @aubwang/dsh-consult bundle patch: one insert contributing the delegation
+# capability to a profile.
+#
+# Two rows, not three. `src/seam.ts` is the Service DEFINITION — an abstract
+# class plus vocabulary types — and mounting it would register a ctx.delegation
+# with no implementations, so it has no row: the PROVIDER row is the service
+# mount, exactly as `@deepseek-ai/dsh-bash-local` mounts `ctx.shell` while
+# `@deepseek-ai/dsh-shell` has no row of its own.
+#
+# A profile's own cordis.patch.yml can override either row by id without
+# touching this package; a patch replaces a row's whole `config`, so restate
+# every key you need.
+
+- insert:
+    # PROVIDER: mounts ctx.delegation over the consult CLI. Requires
+    # ctx.subprocess (dsh-base mounts @deepseek-ai/dsh-subprocess-local).
+    - id: consult-delegation
+      name: '@aubwang/dsh-consult/provider'
+
+    # CONSUMER: the model-facing delegate* tools. Requires ctx.tools and
+    # ctx.delegation; picks up ctx.jobs when one is mounted.
+    - id: tool-delegate
+      name: '@aubwang/dsh-consult/tools'
