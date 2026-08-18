@@ -12,14 +12,17 @@
 
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import type {} from '@deepseek-ai/dsh-subprocess'
+import type { SubprocessHandle } from '@deepseek-ai/dsh-subprocess'
 import {
   boundLines,
   buildConsultEnv,
   delegateArgs,
+  eventsArgs,
   gateConsultVersion,
   mapExit,
   parseDoctorReport,
+  parseEventLine,
+  parseEventsEnvelope,
   parseJobCollection,
   parseJobEnvelope,
   projectJob,
@@ -81,12 +84,10 @@ export interface Config {
   /** Bound for one seam `wait` before it reports `timeout`; background collection re-waits. */
   waitTimeoutMs?: number
   /**
-   * Reserved for M4 event delivery: how many supervisor turns delegation events
-   * may open before degrading to injection. Completion notices in M1 are
-   * delivered by `@deepseek-ai/dsh-tool-jobs`, which owns its own
-   * `maxConsecutiveWakes` budget; this field does not override it.
+   * Delay before restarting an event follow that died while its delegation was
+   * still live — consult's own follow deadline is the routine cause.
    */
-  wakeBudget?: number
+  eventFollowRestartMs?: number
   /** SIGTERM→SIGKILL grace for every consult invocation. */
   graceMs?: number
   /**
@@ -110,13 +111,38 @@ interface PreflightState {
   version?: string
   profiles: string[]
   defaultProfile?: string
+  /** Whether the configured consult exposes the `events` command. */
+  canReport: boolean
   diagnosis?: string
 }
 
 const STEER_UNSUPPORTED = 'consult 1.x has no steer command. Cancel the job and re-delegate with the corrected prompt; '
   + 'native steering arrives with dsh-consult M3.'
-const EVENTS_UNSUPPORTED = 'consult 1.x has no upward event stream. Read progress with delegate_logs; '
-  + 'typed delegation events arrive with dsh-consult M4.'
+const EVENTS_UNSUPPORTED = 'this consult build has no `events` command, so a delegate cannot report upward mid-turn. '
+  + 'Read progress with delegate_logs instead, or install a consult with `consult report`/`consult events`.'
+
+/**
+ * Consecutive follow restarts that produced no event before dying. A broken
+ * install must not turn into an unbounded respawn loop, and a follow that is
+ * genuinely working resets the count on its first event.
+ */
+const MAX_BARREN_FOLLOW_RESTARTS = 5
+
+/** One live follow of a single delegation's event stream. */
+interface Watch {
+  listeners: Set<(event: DelegationEvent) => void>
+  options: DelegationCallOptions | undefined
+  /** Highest report sequence delivered so far; the resume point after a restart. */
+  lastSeq: number
+  /** Set once the terminal lifecycle transition arrived; no further follow starts. */
+  finished: boolean
+  closed: boolean
+  handle: SubprocessHandle | undefined
+  restart: ReturnType<typeof setTimeout> | undefined
+  barrenRestarts: number
+  /** Releases the ctx.effect that owns this follow's process lifetime. */
+  release: (() => void) | undefined
+}
 
 /**
  * Delegation over the consult CLI.
@@ -142,7 +168,7 @@ export class ConsultDelegation extends DelegationService {
     maxTextBytes: z.number().min(256).default(16_000),
     logTailLines: z.number().min(1).default(40),
     waitTimeoutMs: z.number().min(1_000).default(1_500_000),
-    wakeBudget: z.number().min(1).default(3),
+    eventFollowRestartMs: z.number().min(100).default(2_000),
     graceMs: z.number().min(1).default(5_000),
     env: z.dict(z.string()),
   })
@@ -151,10 +177,17 @@ export class ConsultDelegation extends DelegationService {
 
   private commandMemo: Promise<string[]> | undefined
   private preflightMemo: Promise<PreflightState> | undefined
+  private readonly watches = new Map<DelegationJobId, Watch>()
+  private readonly observers = new Set<(event: DelegationEvent) => void>()
 
   constructor(ctx: Context, config: Config) {
     super(ctx)
     this.config = config as ResolvedConfig
+    // Disposal stops every follow: the per-process effect kills the child, and
+    // this closes the loops that would otherwise schedule a restart after it.
+    ctx.effect(() => () => {
+      for (const [id, watch] of [...this.watches]) this.closeWatch(id, watch)
+    })
   }
 
   /** The subprocess seam's spawn callable, resolved per call so a provider swap is picked up. */
@@ -223,6 +256,7 @@ export class ConsultDelegation extends DelegationService {
       return {
         ready: false,
         profiles: [],
+        canReport: false,
         diagnosis: `could not resolve the consult executable ${JSON.stringify(this.config.consultPath)}: `
           + `${error instanceof Error ? error.message : String(error)}. Install consult, or set the plugin's \`consultPath\`.`,
       }
@@ -235,6 +269,7 @@ export class ConsultDelegation extends DelegationService {
       return {
         ready: false,
         profiles: [],
+        canReport: false,
         diagnosis: `could not run \`consult --version\`: ${error instanceof Error ? error.message : String(error)}`,
       }
     }
@@ -245,6 +280,7 @@ export class ConsultDelegation extends DelegationService {
       return {
         ready: false,
         profiles: [],
+        canReport: false,
         diagnosis: `\`${this.config.consultPath} --version\` exited ${versionRun.exitCode ?? 'by signal'} (${output.slice(0, 200)}). `
           + 'consult only accepts `--version` from 1.0 onwards, so this is most likely a pre-1.0 install; '
           + 'this plugin supports >=1.0.0 <2.0.0. Upgrade consult, or point the plugin\'s `consultPath` at a 1.x install.',
@@ -252,20 +288,22 @@ export class ConsultDelegation extends DelegationService {
     }
     const gate = gateConsultVersion(versionRun.stdout)
     if (!gate.ok) {
-      return { ready: false, profiles: [], ...gate.version !== undefined ? { version: gate.version } : {}, diagnosis: gate.reason }
+      return { ready: false, profiles: [], canReport: false, ...gate.version !== undefined ? { version: gate.version } : {}, diagnosis: gate.reason }
     }
 
     const doctorRun = await runConsult(this.spawn, ['doctor', '--json'], invocation).catch(() => undefined)
     if (doctorRun === undefined) {
-      return { ready: false, version: gate.version, profiles: [], diagnosis: 'could not run `consult doctor --json`' }
+      return { ready: false, version: gate.version, profiles: [], canReport: false, diagnosis: 'could not run `consult doctor --json`' }
     }
     const doctor = parseDoctorReport(doctorRun.stdout, doctorRun.stderr)
     const roster = await this.probeProfiles(invocation)
+    const canReport = await this.probeEvents(invocation)
     if (!doctor.canDelegate) {
       return {
         ready: false,
         version: gate.version,
         profiles: roster.profiles,
+        canReport,
         ...roster.defaultProfile !== undefined ? { defaultProfile: roster.defaultProfile } : {},
         diagnosis: `consult cannot delegate right now — ${doctor.diagnosis ?? 'no diagnosis reported'}. `
           + 'Run `consult doctor` in the workspace, and `consult setup --install <profile>` if no profile is configured.',
@@ -276,8 +314,26 @@ export class ConsultDelegation extends DelegationService {
       ready: true,
       version: gate.version,
       profiles: roster.profiles,
+      canReport,
       ...defaultProfile !== undefined ? { defaultProfile } : {},
     }
+  }
+
+  /**
+   * Decide whether this consult can deliver upward events.
+   *
+   * The probe is `consult events --help`: a command's own help exits 0 when the
+   * command exists and 2 when the subcommand is unknown, which is exactly the
+   * distinction being made. It touches no job, no workspace state, and no
+   * profile — unlike `doctor`, running it costs nothing but a process. Version
+   * numbers cannot answer this question: `report`/`events` landed after 1.0.0
+   * was cut, so two builds reporting 1.0.0 differ on it.
+   * @param invocation - the resolved executable, directory, environment, and budgets.
+   * @returns whether the events command exists.
+   */
+  private async probeEvents(invocation: ConsultInvocation): Promise<boolean> {
+    const run = await runConsult(this.spawn, ['events', '--help'], invocation).catch(() => undefined)
+    return run?.exitCode === 0
   }
 
   /** Best-effort profile roster; `agents --json` is unversioned, so a failure is not fatal. */
@@ -322,7 +378,7 @@ export class ConsultDelegation extends DelegationService {
       profiles: state.profiles,
       ...state.defaultProfile !== undefined ? { defaultProfile: state.defaultProfile } : {},
       canSteer: false,
-      canReport: false,
+      canReport: state.canReport,
       ...state.diagnosis !== undefined ? { diagnosis: state.diagnosis } : {},
     }
   }
@@ -413,14 +469,181 @@ export class ConsultDelegation extends DelegationService {
     return Promise.resolve({ supported: false, reason: STEER_UNSUPPORTED })
   }
 
-  override events(_id: DelegationJobId, _fromSeq?: number, _options?: DelegationCallOptions): Promise<DelegationEventPage> {
-    return Promise.resolve({ supported: false, events: [], reason: EVENTS_UNSUPPORTED })
+  override async events(
+    id: DelegationJobId,
+    fromSeq?: number,
+    options?: DelegationCallOptions,
+  ): Promise<DelegationEventPage> {
+    const state = await this.preflight(options)
+    if (!state.ready) {
+      throw new DelegationError('not-ready', 'delegation is unavailable', {
+        ...state.diagnosis !== undefined ? { detail: state.diagnosis } : {},
+      })
+    }
+    if (!state.canReport) return { supported: false, events: [], reason: EVENTS_UNSUPPORTED }
+    const args = eventsArgs(id, { ...fromSeq !== undefined ? { sinceSeq: fromSeq } : {} })
+    const run = await runConsultWithRetry(this.spawn, args, await this.invocation(options))
+    const error = mapExit(run, { command: 'events', jobId: id })
+    if (error !== undefined) throw error
+    const events = parseEventsEnvelope(run.stdout, this.config.maxTextBytes)
+    const nextSeq = events.reduce((highest, event) => Math.max(highest, event.seq ?? 0), fromSeq ?? 0)
+    return { supported: true, events, ...nextSeq > 0 ? { nextSeq } : {} }
   }
 
-  override onEvent(_listener: (event: DelegationEvent) => void): () => void {
-    // No push channel exists yet; the subscription is a well-typed no-op so a
-    // consumer written against M4 loads unchanged against M1.
-    return () => {}
+  override watch(
+    id: DelegationJobId,
+    listener: (event: DelegationEvent) => void,
+    options?: DelegationCallOptions,
+  ): () => void {
+    // A follow outlives the call that asked for it, so the caller's per-call
+    // signal is deliberately dropped: cancelling a tool call must not blind the
+    // supervisor to a delegation that is still running.
+    const { signal: _callSignal, ...followOptions } = options ?? {}
+    let watch = this.watches.get(id)
+    if (watch === undefined) {
+      watch = {
+        listeners: new Set(),
+        options: followOptions,
+        lastSeq: 0,
+        finished: false,
+        closed: false,
+        handle: undefined,
+        restart: undefined,
+        barrenRestarts: 0,
+        release: undefined,
+      }
+      this.watches.set(id, watch)
+      // Preflight is async and `watch` is not, so the follow starts on the
+      // capability answer rather than blocking on it. A consult without the
+      // events command never spawns anything.
+      const starting = watch
+      void this.preflight(options).then((state) => {
+        if (state.ready && state.canReport && !starting.closed) this.startFollow(id, starting)
+        else this.closeWatch(id, starting)
+      }, () => this.closeWatch(id, starting))
+    }
+    const active = watch
+    active.listeners.add(listener)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      active.listeners.delete(listener)
+      if (active.listeners.size === 0) this.closeWatch(id, active)
+    }
+  }
+
+  override onEvent(listener: (event: DelegationEvent) => void): () => void {
+    this.observers.add(listener)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.observers.delete(listener)
+    }
+  }
+
+  /**
+   * Spawn one `consult events <id> --follow --json` and stream its NDJSON.
+   *
+   * The process is owned by a `ctx.effect`, so plugin disposal kills it even
+   * if nothing unsubscribes. It ends on its own when the job finalizes (exit
+   * 0 after the terminal transition); a death while the job is still live —
+   * consult's own 30-minute follow deadline (exit 4), or anything else —
+   * restarts from `--since <lastSeq>` so no report is delivered twice and none
+   * is lost. Restarts that never produce an event are bounded, because a
+   * broken install must not become a respawn loop.
+   */
+  private startFollow(id: DelegationJobId, watch: Watch): void {
+    if (watch.closed || watch.finished) return
+    void (async () => {
+      let invocation: ConsultInvocation
+      try {
+        // `watch.options` already had the caller's signal stripped; the follow
+        // owns its own lifetime through ctx.effect and closeWatch().
+        invocation = await this.invocation(watch.options)
+      } catch {
+        this.closeWatch(id, watch)
+        return
+      }
+      if (watch.closed || watch.finished) return
+      const handle = this.spawn({
+        argv: [...invocation.command, ...eventsArgs(id, { follow: true, sinceSeq: watch.lastSeq })],
+        cwd: invocation.cwd,
+        stdio: { stdin: 'ignore', stdout: 'pipe', stderr: { maxBytes: 4_096 } },
+        graceMs: invocation.graceMs,
+        env: invocation.env,
+      })
+      watch.handle = handle
+      watch.release = this.ctx.effect(() => () => handle.terminate())
+      let produced = false
+      let buffer = ''
+      const consume = (chunk: string, flush: boolean): void => {
+        buffer += chunk
+        const lines = buffer.split('\n')
+        buffer = flush ? '' : lines.pop() ?? ''
+        for (const line of lines) {
+          const event = parseEventLine(line, this.config.maxTextBytes)
+          if (event === undefined) continue
+          produced = true
+          if (event.seq !== undefined) watch.lastSeq = Math.max(watch.lastSeq, event.seq)
+          if (event.type === 'lifecycle' && event.lifecycle?.phase === 'terminal') watch.finished = true
+          this.emit(watch, event)
+        }
+      }
+      handle.stdout?.setEncoding('utf8')
+      handle.stdout?.on('data', (chunk: string) => consume(chunk, false))
+      const outcome = await handle.done.catch(() => undefined)
+      consume('', true)
+      watch.handle = undefined
+      watch.release?.()
+      watch.release = undefined
+      if (watch.closed || watch.finished) {
+        this.closeWatch(id, watch)
+        return
+      }
+      // Exit 2 means the job is unknown to consult: retrying cannot help.
+      if (outcome?.exitCode === 2) {
+        this.closeWatch(id, watch)
+        return
+      }
+      watch.barrenRestarts = produced ? 0 : watch.barrenRestarts + 1
+      if (watch.barrenRestarts > MAX_BARREN_FOLLOW_RESTARTS) {
+        this.closeWatch(id, watch)
+        return
+      }
+      watch.restart = setTimeout(() => {
+        watch.restart = undefined
+        this.startFollow(id, watch)
+      }, this.config.eventFollowRestartMs)
+      watch.restart.unref?.()
+    })()
+  }
+
+  /** Deliver one event to this job's listeners and to every global observer, containing listener throws. */
+  private emit(watch: Watch, event: DelegationEvent): void {
+    for (const listener of [...watch.listeners, ...this.observers]) {
+      try {
+        listener(event)
+      } catch {
+        // A listener that throws must not tear down the follow it is watching.
+      }
+    }
+  }
+
+  /** Stop one follow and forget it. Idempotent. */
+  private closeWatch(id: DelegationJobId, watch: Watch): void {
+    watch.closed = true
+    watch.listeners.clear()
+    if (watch.restart !== undefined) {
+      clearTimeout(watch.restart)
+      watch.restart = undefined
+    }
+    watch.handle?.terminate()
+    watch.handle = undefined
+    watch.release?.()
+    watch.release = undefined
+    if (this.watches.get(id) === watch) this.watches.delete(id)
   }
 }
 

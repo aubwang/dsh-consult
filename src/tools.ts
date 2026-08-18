@@ -19,12 +19,16 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { JobOutcome } from '@deepseek-ai/dsh-jobs'
+import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { Agent } from '@deepseek-ai/dsh-agent'
+import type {} from '@deepseek-ai/dsh-agent'
 import { advanceLogCursor } from './log-cursor.ts'
-import { frameDelegateText, jobLine, renderFailure, renderResult } from './render.ts'
+import { frameDelegateText, jobLine, renderDelegationEvent, renderFailure, renderResult } from './render.ts'
 import {
   isDelegationError,
   type DelegateSpec,
   type DelegationCallOptions,
+  type DelegationEvent,
   type DelegationJob,
   type DelegationResult,
   type ReviewSpec,
@@ -55,8 +59,16 @@ export interface Config {
   logWindowLines?: number
   /** Default tail length for the `delegate_logs` tool. */
   defaultLogTailLines?: number
-  /** Byte cap for one completion notice or `job_output` read. */
+  /** Byte cap for one completion notice, `job_output` read, or delegation-event notice. */
   outputLimitBytes?: number
+  /**
+   * Turns one owner may have opened by delegation-event wakes before further
+   * wake-urgency events degrade to injection; any user-authored input refills
+   * it. The bound exists because the chain is self-exciting: a woken turn may
+   * start the delegation whose next report wakes it again. `@deepseek-ai/dsh-tool-jobs`
+   * keeps its own separate budget for completion notices.
+   */
+  wakeBudget?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -66,6 +78,7 @@ export const Config: z<Config> = z.object({
   logWindowLines: z.number().min(1).default(200),
   defaultLogTailLines: z.number().min(1).default(40),
   outputLimitBytes: z.number().min(256).default(16_000),
+  wakeBudget: z.number().min(0).default(3),
 })
 
 type ResolvedConfig = Required<Config>
@@ -182,6 +195,66 @@ function jobOutcome(result: DelegationResult): JobOutcome {
 
 export function apply(ctx: Context, config: Config = {}): void {
   const resolved = config as ResolvedConfig
+  // A budget is a count of turns, so a fraction never names one and Infinity
+  // would leave the self-exciting chain this field exists to bound unbounded.
+  if (!Number.isSafeInteger(resolved.wakeBudget)) {
+    throw new Error(`tool-delegate: wakeBudget (${resolved.wakeBudget}) must be a whole number of turns`)
+  }
+
+  // Turns this plugin opened on each owner since that owner last consumed human
+  // input. Keyed by the exact Agent, so a same-session replacement starts with
+  // a full budget — the same reasoning `@deepseek-ai/dsh-tool-jobs` applies to
+  // completion notices, kept as a separate budget because the two answer
+  // different questions.
+  const spentWakes = new WeakMap<Agent, number>()
+  if (resolved.wakeBudget > 0) {
+    ctx.on('agent/inbox/claimed', ({ agent, message }) => {
+      // Claiming is where human input actually enters a step. A notice this
+      // plugin queued must not refill the budget it just spent.
+      if (message.source.kind === 'user') spentWakes.delete(agent)
+    })
+  }
+
+  /**
+   * Deliver one delegation event upward.
+   *
+   * Lifecycle transitions are deliberately dropped: `dsh-tool-jobs` already
+   * announces the completion of the background job that tracks this
+   * delegation, and a second terminal notice would cost a step to say the same
+   * thing twice.
+   *
+   * A `wake` event means the delegation cannot progress without the
+   * supervisor, so it opens a turn on an idle owner — but only while the budget
+   * lasts, because a woken turn may start the delegation whose next report
+   * wakes it again. A busy owner is injected either way: the notice joins its
+   * next step, so several reports arriving together cost one step rather than
+   * one turn each.
+   */
+  const deliverEvent = (owner: Agent, event: DelegationEvent): void => {
+    if (event.type === 'lifecycle') return
+    const notice = renderDelegationEvent(event, resolved.outputLimitBytes)
+    try {
+      const message = createUserMessage({
+        content: [{ type: 'text', text: notice.body }],
+        source: {
+          kind: 'plugin',
+          plugin: 'dsh-consult',
+          form: 'notice',
+          summary: boundContextSummary(notice.summary),
+        },
+      })
+      const spent = spentWakes.get(owner) ?? 0
+      if (event.urgency === 'wake' && owner.status === 'idle' && spent < resolved.wakeBudget) {
+        spentWakes.set(owner, spent + 1)
+        owner.followup(message)
+        return
+      }
+      owner.inject(message)
+    } catch {
+      // The owner was disposed between the report and its delivery; a
+      // delegation nobody is waiting for has nobody to notify.
+    }
+  }
 
   /**
    * Collect one published delegation in the background. Cancellation is the
@@ -301,10 +374,21 @@ export function apply(ctx: Context, config: Config = {}): void {
       ...exec.agent !== undefined ? { owner: exec.agent } : {},
       run: () => {
         const readOutput = startLogCursor(job.id, options, controller.signal)
-        const done = collect(job.id, controller, options).finally(() => controller.abort())
+        // Upward reports need somewhere to land, so an unowned delegation
+        // starts no follow at all. The provider also starts none when the
+        // configured consult has no events command.
+        const owner = exec.agent
+        const unwatch = owner === undefined
+          ? () => {}
+          : ctx.delegation.watch(job.id, (event) => deliverEvent(owner, event), detachedOptions(options))
+        const done = collect(job.id, controller, options).finally(() => {
+          controller.abort()
+          unwatch()
+        })
         return {
           cancel: () => {
             controller.abort()
+            unwatch()
             // Best effort and idempotent; the collector settles on the abort
             // regardless of whether the provider-side cancel lands.
             void ctx.delegation.cancel(job.id, detachedOptions(options)).catch(() => {})
