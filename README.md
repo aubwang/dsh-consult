@@ -37,6 +37,7 @@ consult doctor            # must report canDelegate: yes
 - **`delegate_status(job_id?)`** — list recent delegations, or project one.
 - **`delegate_result(job_id)`** — read a finished delegation's answer, artifacts, and lineage. A job that has not finalized returns a `not-final` outcome, not an error.
 - **`delegate_logs(job_id, tail?)`** — a bounded tail of the delegation's rendered transcript.
+- **`delegate_steer(job_id, guidance)`** — interject into a delegation that is still running: its turn is stopped and the same session is immediately re-prompted with the guidance, so the delegation keeps its id, transcript, and budget. Requires a steer-capable consult; registered unconditionally, and an unavailable steer is a typed outcome rather than a missing tool.
 
 A delegate's mid-flight reports are not a tool either: they arrive as notices (see [Delegate reports](#delegate-reports-requires-a-consult-with-reportevents)), because a supervisor should not have to poll for something a delegate deliberately pushed.
 
@@ -145,15 +146,36 @@ The closing line is deliberate: consult has no steer command yet, so the notice 
 | `decision_needed` | wake | `followup()` — opens a turn | `inject()` | `inject()` |
 | `discovery` | info | `inject()` | `inject()` | `inject()` |
 | `progress` | info | `inject()` | `inject()` | `inject()` |
+| `steer` (your own guidance, echoed) | — | **not delivered** | **not delivered** | **not delivered** |
 | lifecycle (`queued`/`running`/`terminal`) | — | **not delivered** | **not delivered** | **not delivered** |
 
-Lifecycle transitions are dropped on purpose: `dsh-tool-jobs` already announces the completion of the background job tracking this delegation, and a second terminal notice would spend a step to say the same thing twice.
+Lifecycle transitions are dropped on purpose: `dsh-tool-jobs` already announces the completion of the background job tracking this delegation, and a second terminal notice would spend a step to say the same thing twice. Steer echoes are dropped for the same class of reason: the supervisor sent them.
 
 Waking is bounded by `wakeBudget`, for the same reason `dsh-tool-jobs` bounds its own: the chain is self-exciting, since a woken turn may start the delegation whose next report wakes it again. Any user-authored inbox claim refills the budget. The two budgets are separate counters — one bounds completion notices, the other bounds mid-flight reports.
 
 #### Token effect
 
 One bounded notice per delivered report, capped by `outputLimitBytes`. consult caps a report at 4 KB of message plus 16 KiB of data and 256 reports per job, so a chatty delegate's worst case is real: lower `outputLimitBytes` if a deployment wants tighter notices. Reports arriving while the owner is busy share a single step.
+
+### Steering (requires a consult with `steer`)
+
+#### What the model sees
+
+`delegate_steer` returns one of three outcomes, and the rendering says what each one leaves open:
+
+| Outcome | When | What the render tells the model |
+|---|---|---|
+| `accepted` | consult stopped the running turn and re-prompted the same session | the delegation keeps its id and continues; do not resend the same guidance |
+| `refused` | a steer is already in flight, the provider is contended, or the delegation is outside its running window | check `delegate_status`, send once more if still running, never resend in a loop; read the answer if it already finished |
+| `unsupported` | this delegation can never be steered (a foreground or `--isolated` job has no socket to reach), or this consult has no `steer` command | stop it with `job_kill` and delegate again with the guidance written into the new prompt |
+
+The distinction is the point: `refused` may clear on its own, `unsupported` never will, and a model that cannot tell them apart either gives up too early or retries forever.
+
+An accepted steer is echoed back into the event stream as a `steer` event. It appears in `ctx.delegation.events()` for inspection but is **never delivered upward** — notifying a supervisor about guidance it just sent is noise.
+
+#### Token effect
+
+One small result per call. The guidance itself is model-authored input, capped at consult's 16 KiB and rejected rather than trimmed above it, since a clipped instruction changes what the delegation is being told to do.
 
 ### `job_output` reads
 
@@ -208,19 +230,21 @@ A consuming delta of the delegation's rendered transcript, in the same untrusted
 - **Exit codes map to domain outcomes.** `3` is retried exactly once and then reported as `busy`; `4` → `timeout`; `5` → `not-final`; `6` → `delegate-failed`; `8` → `review-unsupported`; `1` and anything unexpected → `internal`. `2` is deliberately an infrastructure throw: every argv is plugin-authored, so a usage error means the plugin or its configuration is wrong.
 - **Only `schemaVersion: 1` envelopes are trusted.** Unknown fields are ignored so the contract can evolve additively; an unknown schema version is refused rather than half-parsed. Non-job JSON (`doctor`, `agents`) is defensively parsed and never fatal.
 - **The plugin never reads consult's private state.** The CLI is the whole contract; the only paths it touches are the ones an envelope hands back.
-- **Upward reports are capability-gated at runtime, not by version number.** `report`/`events` landed in consult after 1.0.0 was cut, so two builds both reporting `1.0.0` differ on whether they have them. Preflight settles it by running `consult events --help`: a command's own help exits 0 when the command exists and 2 when the subcommand is unknown. It touches no job, no workspace state, and no profile. A consult without the command reports `canReport: false`, `ctx.delegation.events()` returns a typed unsupported page, and no follow process is ever spawned — delegation itself is unaffected.
+- **Optional commands are capability-gated at runtime, not by version number.** `report`/`events` and `steer` all landed in consult after 1.0.0 was cut, so two builds both reporting `1.0.0` differ on whether they have them. Preflight settles it by running the command's own `--help`: it exits 0 when the command exists and 2 when the subcommand is unknown. It touches no job, no workspace state, and no profile. A consult without `events` reports `canReport: false`, returns a typed unsupported page, and spawns no follow process; one without `steer` reports `canSteer: false` and answers `delegate_steer` with an `unsupported` outcome. Delegation itself is unaffected either way.
 - **Following is one long-lived process per delegation, restarted from where it left off.** `watch()` spawns `consult events <id> --follow --json` with a piped stdout and parses the NDJSON line by line. It ends on its own when the delegation finalizes; if it dies while the job is still live — consult's own 30-minute follow deadline (exit 4) is the routine cause — it restarts after `eventFollowRestartMs` with `--since <lastSeq>`, so no report is delivered twice and none is lost (`--since` filters reports only, and lifecycle transitions are always replayed). Every follow is `ctx.effect`-owned, so plugin disposal kills it; restarts that never produce an event are capped so a broken install cannot become a respawn loop.
-- **Observation is not gated on the ability to delegate.** `events()` and `watch()` require a usable consult binary with the events command, but not `doctor`'s `canDelegate`: a supervisor whose profile configuration breaks while a delegation is in flight must not go blind to what that delegation is reporting. Starting new work still requires full readiness.
+- **Observing and redirecting are not gated on the ability to delegate.** `events()`, `watch()`, and `steer()` require a usable consult binary with the relevant command, but not `doctor`'s `canDelegate`: a supervisor whose profile configuration breaks while a delegation is in flight must not go blind to it, nor lose the ability to redirect it. Starting new work still requires full readiness.
+- **A steer is never retried.** Every other consult call gets one bounded retry on contention (exit 3); steer does not. Exit 3 means a steer is already being delivered, which will not clear by trying again, and two interruptions of the same turn are worse than one that did not land. The guidance also travels as `--message` rather than after `--`, so text beginning with a dash cannot be re-read as a flag.
 - **Background collection is task-owned.** Once `ctx.jobs` publishes the id, the collector uses its own `AbortController` rather than the tool call's signal, so cancelling the outer call stops waiting without killing published work. `job_kill` aborts the collector and fires a best-effort `consult cancel`.
 
 ## Compatibility
 
 | dsh-consult | DeepSeek Harness | consult | status |
 |---|---|---|---|
-| 0.1.0 | 0.1.0-rc.7 | 1.0.0 | tested — delegation only; `canReport: false` |
-| 0.1.0 | 0.1.0-rc.7 | 1.0.0 + `report`/`events` | tested — delegation plus upward reports |
+| 0.1.0 | 0.1.0-rc.7 | 1.0.0 | tested — delegation only; `canReport: false`, `canSteer: false` |
+| 0.1.0 | 0.1.0-rc.7 | 1.0.0 + `report`/`events` | tested — plus upward reports |
+| 0.1.0 | 0.1.0-rc.7 | 1.0.0 + `report`/`events`/`steer` | tested — plus `delegate_steer` |
 
-Released consult 1.0.0 does **not** have `consult report` / `consult events`; they landed after the tag. The plugin detects this at runtime rather than by version string (see the probe below), so both builds work — one simply delivers no mid-flight reports.
+Released consult 1.0.0 has neither `report`/`events` nor `steer`; both landed after the tag, and both report `1.0.0` themselves. The plugin therefore detects each command at runtime rather than by version string (see the probe below). Every build works — an older one simply delivers no mid-flight reports and answers `delegate_steer` with `unsupported`.
 
 Harness packages are pinned as exact peer dependencies during the rc churn; expect breakage across rc bumps and re-pin per release. The consult range (`>=1.0.0 <2.0.0`) is enforced at preflight, not by npm, because consult is an external CLI rather than a package dependency.
 
@@ -276,19 +300,25 @@ DEEPSEEK_API_KEY=<anything> pnpm dsh --profile headless \
 
 ```sh
 node drill/events-live.mjs /path/to/consult/bin/consult
-# canReport: true (consult 1.0.0)
-# events(): supported=true count=3
+# canReport: true  canSteer: true  (consult 1.0.0)
 #   [event] progress (seq 1 urgency info) "reading src/server.ts"
 #   [event] blocked (seq 2 urgency wake) "need a decision on the retry policy"
-#   [event] lifecycle (terminal) "delegation job-drill completed"
+#   [event] steer (seq 3 urgency info) "skip the migration; the schema is frozen"
+# steer (running, no broker): {"supported":false,"reason":"BROKER_UNREACHABLE: ..."}
+# steer (finalized): {"supported":true,"accepted":false,"detail":"job already finalized; cannot steer"}
+# steer (oversized): rejected — guidance is 16385 bytes; the limit is 16384
 ```
+
+The same drill exercises the real `consult steer` against those records. A steer that is *accepted* needs a live broker socket behind a real running job, which a drill that fabricates records cannot create; the three refusal families — which are the ones whose exit-code mapping this plugin owns — are all reachable, and the accepted path is covered by the M5 end-to-end loop.
 
 ## Known Limitations and Deferred Work
 
 - **No steering.** `delegate_steer` does not exist and `ctx.delegation.steer()` answers `{supported: false}`: consult 1.x has no steer command. The documented fallback is cancel plus re-delegate. Arrives with M3 (upstream `consult steer`) + M4 (the tool).
 - **Upward reports need a consult that has them.** Against a consult without `report`/`events`, `capabilities().canReport` is false, `events()` returns a typed unsupported page, and nothing follows anything — the supervisor learns the outcome at completion, exactly as before. There is no fallback that synthesizes reports from the transcript.
 - **A delegate only reports if it is asked to.** `consult report` is a command the delegated agent must choose to run, so a prompt that never mentions it produces lifecycle events and nothing else. Confined delegations cannot execute anything at all, so mid-flight reporting is an inherit-sandbox capability today.
-- **Reports cannot be answered in place.** A `blocked` report wakes the supervisor, but there is no way to reply to a running delegation: the supervisor acts on the information, or kills and re-delegates. Real steering arrives with M3 (upstream `consult steer`) + the `delegate_steer` tool.
+- **Only background, non-isolated delegations can be steered.** A foreground delegate and an `--isolated` job both run their turn in-process with no broker socket to reach, so consult refuses them with `unsupported`. That is a consult boundary, not a plugin one. Everything this plugin starts is background, so the practical limit is `isolated: true`.
+- **Steering is an interruption, not a conversation.** The delegate's current turn is stopped and re-prompted; there is no reply channel and no acknowledgement beyond the exit code. A steer that consult accepted may still be ignored by the delegate.
+- **`status`, `result`, and `logs` still require full readiness**, unlike `events`, `watch`, and `steer`. The same argument for ungating applies to them, but changing their semantics was out of scope for the event and steer work; it is a deliberate, known asymmetry rather than an oversight.
 - **`job_output` transcript reads are polled, not pushed.** The jobs seam's `readOutput` hook is synchronous while the delegation seam exposes the transcript as an asynchronous bounded tail, so background collection refreshes it on a `logPollIntervalMs` timer and on each read. Each refresh spawns one short-lived `consult logs`. M4 replaces the poll with the pushed event stream.
 - **The transcript cursor can report a gap.** It anchors on the last line already delivered; if more than `logWindowLines` lines are rendered between refreshes, the anchor slides out of the window and the read is marked as a gap rather than replaying or skipping silently. Widen the window or shorten the poll for very chatty delegates; the full transcript is always available through `delegate_logs`.
 - **Confined delegations cannot execute anything.** That is consult's own boundary, not this plugin's: confined jobs are denied every execute kind, so a delegate cannot run tests or builds. Verify a returned patch host-side, or grant `sandbox: 'inherit'` deliberately.
