@@ -126,6 +126,27 @@ describe('preflight', () => {
     assert.deepEqual(of(harness, 'doctor')[0]?.argv, ['doctor', '--json', '--read-only', '--sandbox', 'confined'])
   })
 
+  it('holds a failed preflight for its retry window instead of relaunching the profile', async () => {
+    // Preflight really launches the configured profile, so a model retrying
+    // delegate in a loop must not pay that cost on every attempt.
+    const harness = await setup({ FAKE_CONSULT_DOCTOR_FAIL_FIRST: '1' }, { preflightRetryMs: 60_000 })
+    assert.equal((await harness.delegation.capabilities()).ready, false)
+    assert.equal((await harness.delegation.capabilities()).ready, false, 'the cached failure answered')
+    await assert.rejects(harness.delegation.delegate({ prompt: 'p' }), (error: unknown) =>
+      error instanceof DelegationError && error.code === 'not-ready')
+    assert.equal(of(harness, 'doctor').length, 1, 'one probe served every call inside the window')
+  })
+
+  it('re-probes once the retry window has passed', async () => {
+    const harness = await setup({ FAKE_CONSULT_DOCTOR_FAIL_FIRST: '1' }, { preflightRetryMs: 150 })
+    assert.equal((await harness.delegation.capabilities()).ready, false)
+    assert.equal((await harness.delegation.capabilities()).ready, false)
+    assert.equal(of(harness, 'doctor').length, 1)
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    assert.equal((await harness.delegation.capabilities()).ready, true, 'the fixed install is picked up')
+    assert.equal(of(harness, 'doctor').length, 2)
+  })
+
   it('quotes doctor\'s own diagnosis when consult cannot delegate', async () => {
     const harness = await setup({ FAKE_CONSULT_DOCTOR_OK: '0' })
     const capabilities = await harness.delegation.capabilities()
@@ -135,7 +156,7 @@ describe('preflight', () => {
   })
 
   it('memoizes a healthy preflight but re-probes after a failure', async () => {
-    const harness = await setup({ FAKE_CONSULT_DOCTOR_FAIL_FIRST: '1' })
+    const harness = await setup({ FAKE_CONSULT_DOCTOR_FAIL_FIRST: '1' }, { preflightRetryMs: 0 })
     assert.equal((await harness.delegation.capabilities()).ready, false)
     assert.equal((await harness.delegation.capabilities()).ready, true, 'the failed probe was not cached')
     // Count from the first healthy probe rather than from zero: a loaded box
