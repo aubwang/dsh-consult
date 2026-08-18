@@ -217,8 +217,16 @@ describe('mapExit', () => {
     })
   }
 
-  it('treats exit 2 as an infrastructure failure, not a domain outcome', () => {
-    const error = mapExit(run({ exitCode: 2, stderr: 'unknown job' }), { command: 'result', jobId: 'nope' })
+  it('reads exit 2 as unknown-job when consult says the job is missing', () => {
+    const error = mapExit(run({ exitCode: 2, stderr: 'job not found: nope' }), { command: 'result', jobId: 'nope' })
+    assert.ok(error instanceof DelegationError)
+    assert.equal((error as DelegationError).code, 'unknown-job')
+  })
+
+  it('keeps a genuine usage error an infrastructure failure', () => {
+    // Every argv here is plugin-authored, so a usage error means the plugin or
+    // its configuration is wrong — not something a supervisor can react to.
+    const error = mapExit(run({ exitCode: 2, stderr: '--summary is not supported with --json' }), { command: 'wait' })
     assert.ok(error instanceof Error)
     assert.equal(error instanceof DelegationError, false)
     assert.match(error?.message ?? '', /usage or configuration error \(exit 2\)/)
@@ -248,8 +256,7 @@ describe('argv construction', () => {
       prompt: 'p',
       profile: 'codex',
       mode: 'write',
-      isolated: true,
-      sandbox: 'inherit',
+      extensions: { isolated: true, sandbox: 'inherit' },
       after: ['job-1', 'job-2'],
       label: 'audit',
       model: 'sonnet',
@@ -269,8 +276,21 @@ describe('argv construction', () => {
     assert.deepEqual(args.slice(args.indexOf('--agent'), args.indexOf('--agent') + 2), ['--agent', 'claude'])
   })
 
-  it('refuses isolated delegation without write authority', () => {
-    assert.throws(() => delegateArgs({ prompt: 'p', isolated: true }, defaults), (error: unknown) =>
+  it('refuses the isolated extension without write authority', () => {
+    assert.throws(() => delegateArgs({ prompt: 'p', extensions: { isolated: true } }, defaults), (error: unknown) =>
+      error instanceof DelegationError && error.code === 'unsupported')
+  })
+
+  it('rejects an unknown extension key rather than dropping it', () => {
+    // A dropped key is a supervisor believing it set an option it did not.
+    assert.throws(() => delegateArgs({ prompt: 'p', extensions: { sandboxx: 'inherit' } }, defaults), (error: unknown) =>
+      error instanceof DelegationError && error.code === 'unsupported' && /unknown delegation extension/.test(error.message))
+  })
+
+  it('rejects a malformed extension value', () => {
+    assert.throws(() => delegateArgs({ prompt: 'p', extensions: { sandbox: 'nowhere' } }, defaults), (error: unknown) =>
+      error instanceof DelegationError && error.code === 'unsupported')
+    assert.throws(() => delegateArgs({ prompt: 'p', extensions: { isolated: 'yes' } }, defaults), (error: unknown) =>
       error instanceof DelegationError && error.code === 'unsupported')
   })
 
@@ -466,10 +486,13 @@ describe('steer argv and exit mapping', () => {
     assert.equal('supported' in outcome && outcome.supported, true)
   })
 
-  it('keeps exit 2 an infrastructure failure, like every other command', () => {
-    const outcome = mapSteerExit(run({ exitCode: 2, stderr: 'job not found' }), 'nope')
-    assert.ok(outcome instanceof Error)
-    assert.equal(outcome instanceof DelegationError, false)
+  it('reads exit 2 the way every other command does', () => {
+    const missing = mapSteerExit(run({ exitCode: 2, stderr: 'job not found: nope' }), 'nope')
+    assert.ok(missing instanceof DelegationError)
+    assert.equal((missing as DelegationError).code, 'unknown-job')
+    const usage = mapSteerExit(run({ exitCode: 2, stderr: 'guidance is required' }), 'job-7')
+    assert.ok(usage instanceof Error)
+    assert.equal(usage instanceof DelegationError, false)
   })
 
   it('falls back to a supplied reason when consult said nothing', () => {

@@ -36,7 +36,7 @@ consult doctor            # must report canDelegate: yes
 ## Tools
 
 - **`delegate(prompt, profile?, mode?, isolated?, sandbox?, after?, label?, model?, effort?)`** — queue one cold prompt turn and return immediately with `{kind: 'started', job, backgroundJobId?}`. Always background.
-- **`delegate_review(base? | job_id?, profile?, sandbox?, label?, model?, effort?)`** — queue a findings-first review of a pinned git change or of a completed isolated job's patch.
+- **`delegate_review(base? | job_id?, profile?, label?, model?, effort?, extensions?)`** — queue a findings-first review of a pinned git change or of a completed isolated job's patch. Reviewing is an **optional** provider capability; a provider without a version-controlled workspace reports `review-unsupported`.
 - **`delegate_status(job_id?)`** — list recent delegations, or project one.
 - **`delegate_result(job_id)`** — read a finished delegation's answer, artifacts, and lineage. A job that has not finalized returns a `not-final` outcome, not an error.
 - **`delegate_logs(job_id, tail?)`** — a bounded tail of the delegation's rendered transcript.
@@ -236,7 +236,8 @@ A consuming delta of the delegation's rendered transcript, in the same untrusted
 - **Every spawn goes through `ctx.subprocess.spawn`** — never `node:child_process` — so confinement, the credential scrub, bounded collection with spill, tree-kill escalation, and remote execution worlds apply to delegated work exactly as they do to the bash tool.
 - **Host identity is stamped per spawn.** `CONSULT_HOST=dsh` plus `CONSULT_HOST_SESSION_ID=<calling agent's session id>` scope consult's job records to the agent that started them; without them every agent's jobs would collapse into consult's `terminal/default` host session. The session id reaches the provider through the seam's per-call `DelegationCallOptions`, which the tools fill from `exec.agent`.
 - **Preflight is lazy and memoized.** First use runs `consult --version` (gated at `>=1.0.0 <2.0.0`), then `consult doctor --json` **with the configured authority** (`--read-only`/`--write` and `--sandbox <configured>`, because doctor checks exactly one authority and defaults to consult's own), then `consult agents --json`, then one reconciliation pass (below). A healthy probe is cached indefinitely; a not-ready one is cached for `preflightRetryMs` (default 30s) and then re-probed, because doctor really launches the profile and a model retrying `delegate` in a loop must not pay that cost per attempt. A missing, stale, or unconfigured consult becomes a `not-ready` domain outcome quoting doctor's own diagnosis — it never crashes the plugin.
-- **Exit codes map to domain outcomes.** `3` is retried exactly once and then reported as `busy`; `4` → `timeout`; `5` → `not-final`; `6` → `delegate-failed`; `8` → `review-unsupported`; `1` and anything unexpected → `internal`. `2` is deliberately an infrastructure throw: every argv is plugin-authored, so a usage error means the plugin or its configuration is wrong.
+- **Provider-specific options travel in an `extensions` bag.** The seam's standard `DelegateSpec` is prompt, profile, mode, after, label, model, effort — everything a delegation means regardless of who serves it. Confinement and worktree isolation are consult's vocabulary, so they are extension keys the provider declares through `capabilities().extensions` and validates on the way in. An unrecognized key is **rejected by name, not ignored**: a supervisor that misspells `isolated` must not be told its delegation was isolated when it was not. That is the recommended behavior for any provider.
+- **Exit codes map to domain outcomes.** `3` is retried exactly once and then reported as `busy`; `4` → `timeout`; `5` → `not-final`; `6` → `delegate-failed`; `8` → `review-unsupported`; `1` and anything unexpected → `internal`. `2` splits by consult's own message: an unknown job becomes `unknown-job` (a supervisor can cite an id that never existed, and a mistyped id must not look like plugin breakage), while a genuine usage or configuration error stays an infrastructure throw, because every argv is plugin-authored.
 - **Preflight also reconciles the workspace once.** On the successful probe it runs `consult status --all --json` and counts what is still queued or running. The timing carries the argument: the pass runs before this session has delegated anything, so every active job it finds necessarily belongs to an earlier session — no bookkeeping needed. It surfaces and does not reap; see the crashed-session entry under Known Limitations for exactly what is and is not done.
 - **Only `schemaVersion: 1` envelopes are trusted.** Unknown fields are ignored so the contract can evolve additively; an unknown schema version is refused rather than half-parsed. Non-job JSON (`doctor`, `agents`) is defensively parsed and never fatal.
 - **The plugin never reads consult's private state.** The CLI is the whole contract; the only paths it touches are the ones an envelope hands back.
@@ -329,7 +330,7 @@ The same drill exercises the real `consult steer` against those records. A steer
 
 **Why it exists.** The seam was designed alongside exactly one provider, which is how an interface quietly becomes a description of its only implementation. `tests/seam-portability.test.ts` runs the *same* `tools.ts` — the same six tools, the same `ctx.jobs` integration, the same untrusted-data framing — over the toy, in a composition where the only differing row is the provider. Everything that still passes is a claim about the seam rather than about consult, and the friction the exercise surfaced is recorded honestly below rather than smoothed away.
 
-**What it deliberately does not do.** No durability (records die with the process, so there is nothing to reconcile), no isolation, no authority enforcement, no review, no steering, no upward events, no chaining. It refuses `isolated: true` and `after: [...]` rather than accepting flags it cannot honor — silently dropping `isolated` would let a supervisor believe its edits were sandboxed when they were not.
+**What it deliberately does not do.** No durability (records die with the process, so there is nothing to reconcile), no isolation, no authority enforcement, no review, no steering, no upward events, no chaining. It refuses every extension key, `mode: 'write'`, and `after: [...]` rather than accepting options it cannot honor, and reports neither `profile` nor `mode` because it models neither.
 
 **One provider per context.** `ctx.delegation` is a single service name, so mounting both providers in one context throws — cordis' standard duplicate-service behavior. Swapping is a one-row change, since the consumer talks only to the seam; `drill/toy.patch.yml` is a runnable version:
 
@@ -340,19 +341,31 @@ DEEPSEEK_API_KEY=<anything> pnpm dsh --profile headless \
 # → [drill] delegation tools: delegate, delegate_logs, delegate_result, delegate_review, delegate_status, delegate_steer
 ```
 
-### Where the seam is still consult-shaped
+### What the second provider changed about the seam
 
-Writing a provider that shares nothing with consult is the only way to find these, and they are worth knowing before a reviewer or council consumer calcifies on the interface. None of them broke the portability suite; all of them cost the toy provider an apology.
+Writing a provider that shares nothing with consult is the only way to find where an interface has quietly become a description of its only implementation. Four of the seven things it found were fixed in **seam v2**; three remain, documented as conventions rather than defects.
 
-- **`DelegateSpec.sandbox: 'confined' | 'inherit'` is consult's confinement vocabulary verbatim.** dsh has its own sandbox axis (`read-only`/`workspace-write`/…), and a provider with neither has no meaning for the field at all. This is the clearest leak: the enum reaches the model in the `delegate` tool schema.
-- **`DelegateSpec.isolated` is git-worktree-shaped.** "Run in a detached seeded worktree and return a patch" is a VCS operation, not a delegation concept. A provider without a checkout can only refuse.
-- **`review()` is a first-class seam method, and `ReviewSpec` pins its input as a git base ref or a prior job's patch.** That `review` is a *verb on the service* rather than a shape of delegation follows consult's subcommand layout; a provider with no VCS can only refuse the whole method.
-- **`DelegationArtifacts` presumes a patch-producing, filesystem-mutating delegate** (`patchPath`, `touchedFiles`).
-- **There is no domain code for "unknown delegation".** Both providers independently chose to throw a plain `Error`, since `DelegationErrorCode` has no member for it. The convention is right, but it is currently folklore rather than contract.
-- **`DelegationJob.profile` and `.mode` are required.** A provider with one delegate and no authority axis must invent values; the toy reports `profile: 'toy'`, `mode: 'read-only'` because the type demands something.
+**Resolved in v2:**
+
+- **Confinement and worktree isolation left `DelegateSpec`.** `sandbox` and `isolated` were consult's vocabulary reaching the model in a tool schema. They are now extension keys the consult provider declares and validates; `mode` stayed standard, because whether a delegation may mutate the workspace is a question every delegation answers.
+- **`review()` became optional**, with `canReview` beside it. `ReviewSpec` keeps its git vocabulary and is now honestly labelled the optional VCS-review capability — a provider without a checkout simply does not implement it.
+- **`unknown-job` became a real error code.** Both providers had independently invented the same convention (throw a plain `Error`), which is exactly what a missing contract looks like.
+- **`DelegationJob.profile` and `.mode` became optional**, so a provider with one delegate and no authority axis stops inventing values to satisfy a type.
+
+**Still consult-shaped, deliberately:**
+
+- **`DelegationArtifacts` presumes a patch-producing, filesystem-mutating delegate** (`patchPath`, `touchedFiles`). Both fields are optional, so a provider that produces neither omits them; generalizing further costs more than it buys until a provider with different artifacts exists.
 - **`events(id, fromSeq?)` presumes a monotonic per-job sequence.** A provider whose events carry only timestamps would have to synthesize one to be resumable.
+- **`ReviewSpec`'s `base`/`jobId` are VCS-and-patch-shaped** — now scoped by being optional-capability-only, but unchanged.
 
 One packaging wart the exercise also caught and this package fixed: the bounding helpers every provider owes the seam lived inside `consult-cli.ts`, so the dsh-native provider was importing its truncation rules from the consult adapter. They now live in `src/bounds.ts`.
+
+### Writing another provider
+
+- **Reject extension keys you do not understand**, by name. Silently ignoring one turns a supervisor's typo into an option it believes it set.
+- **Omit what you do not model.** `profile` and `mode` on a projected job, and `review()` entirely, are all absences the consumer copes with. Inventing a value to satisfy a type is how the seam drifts.
+- **Refuse rather than downgrade.** A provider with no write path rejects `mode: 'write'` with an `unsupported` error; quietly running read-only would let a supervisor believe an edit was attempted.
+- **Throw `DelegationError('unknown-job')` for an id you never issued**, so a mistyped id reads as a supervisor mistake rather than plugin breakage.
 
 ## Full-loop drill
 

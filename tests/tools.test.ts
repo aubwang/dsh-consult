@@ -129,7 +129,13 @@ describe('delegate', () => {
 
   it('carries the model\'s authority selectors into the delegation', async () => {
     const harness = await setup({ tools: { trackJobs: false } })
-    await harness.call('delegate', { prompt: 'p', mode: 'write', isolated: true, sandbox: 'inherit', model: 'sonnet', effort: 'high' })
+    await harness.call('delegate', {
+      prompt: 'p',
+      mode: 'write',
+      model: 'sonnet',
+      effort: 'high',
+      extensions: { isolated: true, sandbox: 'inherit' },
+    })
     const argv = harness.invocations().find((entry) => entry.argv[0] === 'delegate')?.argv ?? []
     assert.ok(argv.includes('--write'))
     assert.ok(argv.includes('--isolated'))
@@ -148,7 +154,7 @@ describe('delegate', () => {
   })
 
   it('lets an infrastructure failure become an error result', async () => {
-    const harness = await setup({ scenario: { FAKE_CONSULT_EXIT_DELEGATE: '2' } })
+    const harness = await setup({ scenario: { FAKE_CONSULT_EXIT_DELEGATE: '2', FAKE_CONSULT_USAGE_STDERR: '1' } })
     const result = await harness.call('delegate', { prompt: 'p' })
     assert.equal(result.isError, true)
   })
@@ -257,6 +263,31 @@ describe('delegate_status, delegate_result, delegate_logs', () => {
     const result = await harness.call('delegate_logs', { job_id: 'job-1', tail: 3 })
     assert.equal((value(result).text as string).trim(), 'line 98\nline 99\nline 100')
     assert.match(text(result), /transcript tail/)
+  })
+
+  it('reports an unknown job id as a domain outcome, not plugin breakage', async () => {
+    // A mistyped id is a supervisor mistake it can correct, so it must not
+    // arrive looking like the plugin fell over.
+    const harness = await setup({ scenario: { FAKE_CONSULT_EXIT_RESULT: '2' } })
+    const result = await harness.call('delegate_result', { job_id: 'nope' })
+    assert.equal(result.isError, false)
+    assert.equal(value(result).code, 'unknown-job')
+    assert.match(text(result), /\[unknown-job]/)
+  })
+
+  it('passes provider extensions straight through', async () => {
+    const harness = await setup({ tools: { trackJobs: false } })
+    await harness.call('delegate', { prompt: 'p', extensions: { sandbox: 'inherit' } })
+    const argv = harness.invocations().find((entry) => entry.argv[0] === 'delegate')?.argv ?? []
+    assert.deepEqual(argv.slice(argv.indexOf('--sandbox'), argv.indexOf('--sandbox') + 2), ['--sandbox', 'inherit'])
+  })
+
+  it('surfaces an unknown extension key as a domain outcome', async () => {
+    const harness = await setup({ tools: { trackJobs: false } })
+    const result = await harness.call('delegate', { prompt: 'p', extensions: { sandboxx: 'inherit' } })
+    assert.equal(result.isError, false)
+    assert.equal(value(result).code, 'unsupported')
+    assert.match(text(result), /unknown delegation extension/)
   })
 
   it('rejects a nonsensical tail as an argument error', async () => {

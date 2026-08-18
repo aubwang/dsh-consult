@@ -78,6 +78,8 @@ describe('the tools against a provider that is not consult', () => {
     assert.deepEqual([...capabilities.profiles], ['toy'])
     assert.equal(capabilities.canSteer, false)
     assert.equal(capabilities.canReport, false)
+    assert.equal(capabilities.canReview, false)
+    assert.deepEqual(capabilities.extensions, {})
     // Every tool the consult composition registers is registered here too.
     const names = harness.ctx.tools.schemas().map((schema) => schema.name).filter((name) => name.startsWith('delegate'))
     assert.deepEqual(names.sort(), ['delegate', 'delegate_logs', 'delegate_result', 'delegate_review', 'delegate_status', 'delegate_steer'])
@@ -181,8 +183,12 @@ describe('the tools against a provider that is not consult', () => {
     assert.equal(typeof harness.ctx.delegation.watch('toy-1', () => {}), 'function')
   })
 
-  it('surfaces a provider that cannot review as a domain outcome', async () => {
+  it('reports a provider with no review capability as a domain outcome', async () => {
+    // Seam v2 made review optional: the toy does not implement the method at
+    // all, and the consumer reads that absence rather than crashing on it.
     const harness = await setup()
+    assert.equal((await harness.ctx.delegation.capabilities()).canReview, false)
+    assert.equal(harness.ctx.delegation.review, undefined)
     const review = await harness.call('delegate_review', { base: 'main' })
     assert.equal(review.isError, false)
     assert.equal(value(review).code, 'review-unsupported')
@@ -225,14 +231,41 @@ describe('the tools against a provider that is not consult', () => {
     assert.equal(/not shown/.test(result.finalText as string), false)
   })
 
-  it('surfaces spec fields the provider cannot honor instead of ignoring them', async () => {
-    // The seam's DelegateSpec carries options a provider may have no notion of.
-    // Refusing is the honest answer; silently dropping `isolated` would let a
-    // supervisor believe its edits were sandboxed when they were not.
+  it('rejects an extension it does not understand rather than dropping it', async () => {
+    // Silent-ignore turns a supervisor's typo into an option it believes it
+    // set; the recommended provider behavior is to refuse the key by name.
     const harness = await setup()
-    const isolated = await harness.call('delegate', { prompt: 'p', mode: 'write', isolated: true })
-    assert.equal(isolated.isError, false)
-    assert.equal(value(isolated).code, 'unsupported')
-    assert.match(text(isolated), /no workspace to detach/)
+    const result = await harness.call('delegate', { prompt: 'p', extensions: { sandbox: 'inherit' } })
+    assert.equal(result.isError, false)
+    assert.equal(value(result).code, 'unsupported')
+    assert.match(text(result), /accepts no delegation extensions/)
+    assert.match(text(result), /"sandbox"/)
+  })
+
+  it('refuses write mode rather than quietly downgrading the grant', async () => {
+    const harness = await setup()
+    const result = await harness.call('delegate', { prompt: 'p', mode: 'write' })
+    assert.equal(result.isError, false)
+    assert.equal(value(result).code, 'unsupported')
+    assert.match(text(result), /no write path/)
+  })
+
+  it('reports an unknown delegation with the typed code both providers share', async () => {
+    const harness = await setup()
+    const result = await harness.call('delegate_result', { job_id: 'nope' })
+    assert.equal(result.isError, false)
+    assert.equal(value(result).code, 'unknown-job')
+  })
+
+  it('omits profile and mode rather than inventing them', async () => {
+    const harness = await setup({ delayMs: 20 })
+    const owner = harness.owner('toy-session-10')
+    const jobId = startedJobId(await harness.call('delegate', { prompt: 'anonymous' }, owner.agent))
+    const listed = value(await harness.call('delegate_status', { job_id: jobId }))
+    const job = (listed.jobs as Array<Record<string, unknown>>)[0] as Record<string, unknown>
+    assert.equal(job.profile, undefined)
+    assert.equal(job.mode, undefined)
+    // The render copes with their absence instead of printing "undefined".
+    assert.equal(/profile=|mode=/.test(text(await harness.call('delegate_status', { job_id: jobId }))), false)
   })
 })

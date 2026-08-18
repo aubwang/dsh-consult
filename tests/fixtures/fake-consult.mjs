@@ -26,6 +26,7 @@
  *   FAKE_CONSULT_NO_EVENTS      '1' removes the `events` command (a pre-report consult build)
  *   FAKE_CONSULT_NO_STEER       '1' removes the `steer` command (a pre-steer consult build)
  *   FAKE_CONSULT_NO_BROKERS     '1' removes the `brokers` command (an old consult build)
+ *   FAKE_CONSULT_USAGE_STDERR   '1' makes a forced exit 2 read as a usage error, not a missing job
  *   FAKE_CONSULT_ACTIVE_JOBS    jobs `status --all` reports as queued/running   (default 0)
  *   FAKE_CONSULT_FINAL_JOBS     jobs `status --all` reports as completed        (default 0)
  *   FAKE_CONSULT_EVENTS         JSON array of raw events served by `events`   (default: a full job)
@@ -68,7 +69,7 @@ switch (command) {
     break
   case 'delegate':
   case 'review':
-    if (forced !== undefined) exitWith(forced, `${command} failed\n`)
+    if (forced !== undefined) exitWith(forced, forced === 2 ? usageOrMissing(`${command}: bad flag\n`) : `${command} failed\n`)
     out(`${JSON.stringify(envelope({ status: 'queued', kind: command }))}\n`)
     exit(0)
     break
@@ -77,17 +78,17 @@ switch (command) {
     break
   case 'wait':
     await sleep()
-    if (forced !== undefined) exitWith(forced, 'wait failed\n')
+    if (forced !== undefined) exitWith(forced, forced === 2 ? usageOrMissing('wait: bad flag\\n') : 'wait failed\\n')
     out(`${JSON.stringify({ schemaVersion: schemaVersion(), jobs: waitIds().map((id) => payload({ id })) })}\n`)
     exit(0)
     break
   case 'result':
-    if (forced !== undefined) exitWith(forced, 'result failed\n')
+    if (forced !== undefined) exitWith(forced, forced === 2 ? usageOrMissing('result: bad flag\\n') : 'result failed\\n')
     out(`${JSON.stringify(envelope({ id: argv[1] }))}\n`)
     exit(0)
     break
   case 'logs':
-    if (forced !== undefined) exitWith(forced, 'logs failed\n')
+    if (forced !== undefined) exitWith(forced, forced === 2 ? usageOrMissing('logs: bad flag\\n') : 'logs failed\\n')
     out(logs())
     exit(0)
     break
@@ -99,12 +100,12 @@ switch (command) {
     break
   case 'brokers':
     if (process.env.FAKE_CONSULT_NO_BROKERS === '1') exitWith(2, 'unknown subcommand: brokers\n')
-    if (forced !== undefined) exitWith(forced, 'brokers failed\n')
+    if (forced !== undefined) exitWith(forced, forced === 2 ? usageOrMissing('brokers: bad flag\\n') : 'brokers failed\\n')
     out('(no brokers)\n')
     exit(0)
     break
   case 'cancel':
-    if (forced !== undefined) exitWith(forced, 'cancel failed\n')
+    if (forced !== undefined) exitWith(forced, forced === 2 ? usageOrMissing('cancel: bad flag\\n') : 'cancel failed\\n')
     out(`cancelled ${argv[1]}\n`)
     exit(0)
     break
@@ -133,7 +134,7 @@ async function events() {
   }
   const jobId = argv[1]
   if (jobId === undefined || jobId.startsWith('--')) exitWith(2, 'job id is required\n')
-  if (forced !== undefined) exitWith(forced, 'events failed\n')
+  if (forced !== undefined) exitWith(forced, forced === 2 ? usageOrMissing('events: bad flag\\n') : 'events failed\\n')
 
   const since = Number(flagValue('--since') ?? '0')
   const all = process.env.FAKE_CONSULT_EVENTS === undefined
@@ -191,7 +192,7 @@ function steer() {
 function steerStderr(code) {
   return {
     1: 'steer is not available for job job-1 (inline runner); cancel and re-delegate with the guidance in the prompt\n',
-    2: 'job not found\n',
+    2: usageOrMissing('guidance is required\n'),
     3: 'STEER_PENDING: a previous steer is still being delivered\n',
     5: 'job already finalized; cannot steer (status=completed)\n',
   }[String(code)] ?? 'steer failed\n'
@@ -217,7 +218,7 @@ function doctor() {
 
 function status() {
   const id = argv[1] !== undefined && !argv[1].startsWith('--') ? argv[1] : undefined
-  if (forced !== undefined) exitWith(forced, 'status failed\n')
+  if (forced !== undefined) exitWith(forced, forced === 2 ? usageOrMissing('status: bad flag\\n') : 'status failed\\n')
   if (id === undefined && argv.includes('--all')) {
     // The reconciliation listing: a controllable mix of live and finished jobs.
     const active = Number(process.env.FAKE_CONSULT_ACTIVE_JOBS ?? '0')
@@ -335,6 +336,14 @@ function modeArg() {
 
 function sandboxArg() {
   return flagValue('--sandbox') ?? 'confined'
+}
+
+/**
+ * consult reports usage errors and unknown jobs with the same exit code, and
+ * the plugin tells them apart by the message, so a scenario has to pick one.
+ */
+function usageOrMissing(usage) {
+  return process.env.FAKE_CONSULT_USAGE_STDERR === '1' ? usage : 'job not found: job-1\n'
 }
 
 function forcedExit(name, count) {
