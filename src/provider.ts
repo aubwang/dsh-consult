@@ -644,6 +644,14 @@ export class ConsultDelegation extends DelegationService {
     // supervisor to a delegation that is still running.
     const { signal: _callSignal, ...followOptions } = options ?? {}
     let watch = this.watches.get(id)
+    // A watch that already reached its terminal transition (or was closed) is a
+    // spent record, not a subscription to join: attaching to it would add a
+    // listener nothing will ever call, because its follow process is gone and
+    // no new one starts. Retire it and follow again from scratch.
+    if (watch !== undefined && (watch.closed || watch.finished)) {
+      this.closeWatch(id, watch)
+      watch = undefined
+    }
     if (watch === undefined) {
       watch = {
         listeners: new Set(),
