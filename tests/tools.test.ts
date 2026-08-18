@@ -608,7 +608,10 @@ describe('earlier-session announcement', () => {
   })
 
   it('waits for a healthy preflight instead of announcing zero', async () => {
-    const harness = await setup({ scenario: { FAKE_CONSULT_ACTIVE_JOBS: '2', FAKE_CONSULT_DOCTOR_FAIL_FIRST: '1' } })
+    const harness = await setup({
+      scenario: { FAKE_CONSULT_ACTIVE_JOBS: '2', FAKE_CONSULT_DOCTOR_FAIL_FIRST: '1' },
+      provider: { preflightRetryMs: 0 },
+    })
     // The first call cannot know anything: preflight is failing.
     assert.deepEqual(contextsOf(await harness.call('delegate_status', {})), [])
     const second = contextsOf(await harness.call('delegate_status', {}))

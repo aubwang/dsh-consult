@@ -88,6 +88,13 @@ export interface Config {
   /** Bound for one seam `wait` before it reports `timeout`; background collection re-waits. */
   waitTimeoutMs?: number
   /**
+   * How long a FAILED preflight is cached before the next call re-probes.
+   * Preflight really launches the configured profile, so a model retrying
+   * `delegate` in a loop against a broken install would otherwise pay that cost
+   * on every attempt. `0` re-probes on every call.
+   */
+  preflightRetryMs?: number
+  /**
    * Delay before restarting an event follow that died while its delegation was
    * still live — consult's own follow deadline is the routine cause.
    */
@@ -183,6 +190,7 @@ export class ConsultDelegation extends DelegationService {
     maxTextBytes: z.number().min(256).default(16_000),
     logTailLines: z.number().min(1).default(40),
     waitTimeoutMs: z.number().min(1_000).default(1_500_000),
+    preflightRetryMs: z.number().min(0).default(30_000),
     eventFollowRestartMs: z.number().min(100).default(2_000),
     graceMs: z.number().min(1).default(5_000),
     env: z.dict(z.string()),
@@ -192,6 +200,8 @@ export class ConsultDelegation extends DelegationService {
 
   private commandMemo: Promise<string[]> | undefined
   private preflightMemo: Promise<PreflightState> | undefined
+  /** When the cached preflight settled NOT ready; undefined while it is healthy. */
+  private preflightFailedAt: number | undefined
   private readonly watches = new Map<DelegationJobId, Watch>()
   private readonly observers = new Set<(event: DelegationEvent) => void>()
 
@@ -244,13 +254,33 @@ export class ConsultDelegation extends DelegationService {
     }
   }
 
-  /** Run preflight at most once per healthy outcome; re-probe after any failure. */
+  /**
+   * Run preflight at most once per healthy outcome, and re-probe after a
+   * failure — but not immediately.
+   *
+   * Probing costs a real profile launch, so a model retrying `delegate` against
+   * a broken install would pay it on every attempt. A failed result is held for
+   * `preflightRetryMs` and answered from cache; after that the next call probes
+   * again, so an operator who fixes the install does not have to restart
+   * anything. A probe that REJECTS (as opposed to reporting not-ready) is not
+   * cached at all: it produced no diagnosis worth repeating.
+   */
   private preflight(options?: DelegationCallOptions): Promise<PreflightState> {
+    if (
+      this.preflightFailedAt !== undefined
+      && Date.now() - this.preflightFailedAt >= this.config.preflightRetryMs
+    ) {
+      this.preflightMemo = undefined
+      this.preflightFailedAt = undefined
+    }
     if (this.preflightMemo === undefined) {
       const memo = this.probe(options)
       memo.then(
-        (state) => { if (!state.ready) this.preflightMemo = undefined },
-        () => { this.preflightMemo = undefined },
+        (state) => { if (!state.ready) this.preflightFailedAt = Date.now() },
+        () => {
+          this.preflightMemo = undefined
+          this.preflightFailedAt = undefined
+        },
       )
       this.preflightMemo = memo
     }
