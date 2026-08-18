@@ -13,8 +13,8 @@
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { SubprocessHandle } from '@deepseek-ai/dsh-subprocess'
+import { boundLines } from './bounds.ts'
 import {
-  boundLines,
   buildConsultEnv,
   countActiveDelegations,
   delegateArgs,

@@ -7,10 +7,8 @@
 
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
+import { boundJson, boundLines, boundText } from '../src/bounds.ts'
 import {
-  boundJson,
-  boundLines,
-  boundText,
   buildConsultEnv,
   delegateArgs,
   eventsArgs,
