@@ -1,0 +1,25 @@
+# Composition-time provider swap: the same delegation tools over a different
+# ctx.delegation. Nothing but the provider row changes — the tools row is
+# byte-identical to the one in cordis.patch.yml.
+#
+# Only ONE provider may be mounted per context: `ctx.delegation` is a single
+# service name, and loading a second implementation throws (cordis' standard
+# duplicate-service behavior). A composition chooses one.
+#
+#   cd /home/dev/dev/deepseek-harness
+#   DEEPSEEK_API_KEY=<anything> pnpm dsh --profile headless \
+#     --patch /home/dev/dsh-consult/drill/toy.patch.yml "probe"
+
+- insert:
+    # PROVIDER: the toy, in place of '@aubwang/dsh-consult/provider'.
+    - id: consult-delegation
+      name: '/home/dev/dsh-consult/lib/toy-provider.js'
+      config:
+        delayMs: 50
+
+    # CONSUMER: unchanged.
+    - id: tool-delegate
+      name: '/home/dev/dsh-consult/lib/tools.js'
+
+    - id: drill-list-tools
+      name: '/home/dev/dsh-consult/drill/list-tools.mjs'

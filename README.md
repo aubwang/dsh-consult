@@ -11,6 +11,7 @@ It ships three plugin modules from one package:
 | `@aubwang/dsh-consult/seam` | Service **Definition** — abstract `DelegationService` plus the provider-neutral vocabulary | (types only; no composition row) |
 | `@aubwang/dsh-consult/provider` | Service **Provider** — `ConsultDelegation` over the real consult CLI | mounts `ctx.delegation`; injects `ctx.subprocess` |
 | `@aubwang/dsh-consult/tools` | **Consumer** — the model-facing `delegate*` tools | injects `ctx.tools`, `ctx.delegation`; uses `ctx.jobs` when present |
+| `@aubwang/dsh-consult/toy-provider` | **Second provider** — a trivial dsh-native one, kept for [seam honesty](#the-second-provider) | mounts `ctx.delegation`; injects `ctx.subprocess` |
 
 The tools talk **only** to `ctx.delegation`. Nothing in `tools.ts` knows that consult exists, so a future dsh-native delegation provider drops in behind the same seam without touching the model-facing surface.
 
@@ -321,6 +322,37 @@ node drill/events-live.mjs /path/to/consult/bin/consult
 ```
 
 The same drill exercises the real `consult steer` against those records. A steer that is *accepted* needs a live broker socket behind a real running job, which a drill that fabricates records cannot create; the three refusal families — which are the ones whose exit-code mapping this plugin owns — are all reachable, and the accepted path is covered by the M5 end-to-end loop.
+
+## The second provider
+
+`@aubwang/dsh-consult/toy-provider` is a deliberately trivial second implementation of `ctx.delegation`: a delegation is one short-lived subprocess spawned through `ctx.subprocess`, and everything else is an in-memory record. It is a test double with a real service shell, not a product.
+
+**Why it exists.** The seam was designed alongside exactly one provider, which is how an interface quietly becomes a description of its only implementation. `tests/seam-portability.test.ts` runs the *same* `tools.ts` — the same six tools, the same `ctx.jobs` integration, the same untrusted-data framing — over the toy, in a composition where the only differing row is the provider. Everything that still passes is a claim about the seam rather than about consult, and the friction the exercise surfaced is recorded honestly below rather than smoothed away.
+
+**What it deliberately does not do.** No durability (records die with the process, so there is nothing to reconcile), no isolation, no authority enforcement, no review, no steering, no upward events, no chaining. It refuses `isolated: true` and `after: [...]` rather than accepting flags it cannot honor — silently dropping `isolated` would let a supervisor believe its edits were sandboxed when they were not.
+
+**One provider per context.** `ctx.delegation` is a single service name, so mounting both providers in one context throws — cordis' standard duplicate-service behavior. Swapping is a one-row change, since the consumer talks only to the seam; `drill/toy.patch.yml` is a runnable version:
+
+```sh
+cd /home/dev/dev/deepseek-harness
+DEEPSEEK_API_KEY=<anything> pnpm dsh --profile headless \
+  --patch /home/dev/dsh-consult/drill/toy.patch.yml "probe"
+# → [drill] delegation tools: delegate, delegate_logs, delegate_result, delegate_review, delegate_status, delegate_steer
+```
+
+### Where the seam is still consult-shaped
+
+Writing a provider that shares nothing with consult is the only way to find these, and they are worth knowing before a reviewer or council consumer calcifies on the interface. None of them broke the portability suite; all of them cost the toy provider an apology.
+
+- **`DelegateSpec.sandbox: 'confined' | 'inherit'` is consult's confinement vocabulary verbatim.** dsh has its own sandbox axis (`read-only`/`workspace-write`/…), and a provider with neither has no meaning for the field at all. This is the clearest leak: the enum reaches the model in the `delegate` tool schema.
+- **`DelegateSpec.isolated` is git-worktree-shaped.** "Run in a detached seeded worktree and return a patch" is a VCS operation, not a delegation concept. A provider without a checkout can only refuse.
+- **`review()` is a first-class seam method, and `ReviewSpec` pins its input as a git base ref or a prior job's patch.** That `review` is a *verb on the service* rather than a shape of delegation follows consult's subcommand layout; a provider with no VCS can only refuse the whole method.
+- **`DelegationArtifacts` presumes a patch-producing, filesystem-mutating delegate** (`patchPath`, `touchedFiles`).
+- **There is no domain code for "unknown delegation".** Both providers independently chose to throw a plain `Error`, since `DelegationErrorCode` has no member for it. The convention is right, but it is currently folklore rather than contract.
+- **`DelegationJob.profile` and `.mode` are required.** A provider with one delegate and no authority axis must invent values; the toy reports `profile: 'toy'`, `mode: 'read-only'` because the type demands something.
+- **`events(id, fromSeq?)` presumes a monotonic per-job sequence.** A provider whose events carry only timestamps would have to synthesize one to be resumable.
+
+One packaging wart the exercise also caught and this package fixed: the bounding helpers every provider owes the seam lived inside `consult-cli.ts`, so the dsh-native provider was importing its truncation rules from the consult adapter. They now live in `src/bounds.ts`.
 
 ## Full-loop drill
 
