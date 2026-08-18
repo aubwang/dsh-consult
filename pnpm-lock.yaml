@@ -1,0 +1,69 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    devDependencies:
+      '@deepseek-ai/cordis':
+        specifier: link:../dev/deepseek-harness/vendor/cordis
+        version: link:../dev/deepseek-harness/vendor/cordis
+      '@deepseek-ai/dsh-agent':
+        specifier: link:../dev/deepseek-harness/packages/core/agent
+        version: link:../dev/deepseek-harness/packages/core/agent
+      '@deepseek-ai/dsh-jobs':
+        specifier: link:../dev/deepseek-harness/packages/jobs/jobs
+        version: link:../dev/deepseek-harness/packages/jobs/jobs
+      '@deepseek-ai/dsh-jobs-local':
+        specifier: link:../dev/deepseek-harness/packages/jobs/jobs-local
+        version: link:../dev/deepseek-harness/packages/jobs/jobs-local
+      '@deepseek-ai/dsh-llm':
+        specifier: link:../dev/deepseek-harness/packages/llm/llm
+        version: link:../dev/deepseek-harness/packages/llm/llm
+      '@deepseek-ai/dsh-session':
+        specifier: link:../dev/deepseek-harness/packages/core/session
+        version: link:../dev/deepseek-harness/packages/core/session
+      '@deepseek-ai/dsh-subprocess':
+        specifier: link:../dev/deepseek-harness/packages/subprocess/subprocess
+        version: link:../dev/deepseek-harness/packages/subprocess/subprocess
+      '@deepseek-ai/dsh-subprocess-local':
+        specifier: link:../dev/deepseek-harness/packages/subprocess/subprocess-local
+        version: link:../dev/deepseek-harness/packages/subprocess/subprocess-local
+      '@deepseek-ai/dsh-tools':
+        specifier: link:../dev/deepseek-harness/packages/core/tools
+        version: link:../dev/deepseek-harness/packages/core/tools
+      '@deepseek-ai/schemastery':
+        specifier: link:../dev/deepseek-harness/vendor/schemastery
+        version: link:../dev/deepseek-harness/vendor/schemastery
+      '@types/node':
+        specifier: ^24.0.0
+        version: 24.13.3
+      typescript:
+        specifier: 6.0.3
+        version: 6.0.3
+
+packages:
+
+  '@types/node@24.13.3':
+    resolution: {integrity: sha512-Dh8vAsV36ig5wa9OX4pXvMc9D3Veibfw2wix0CUwYODLD8nkj9UsLjASr49nPg+2eKzxhBV+v7L8pXvT4e639Q==}
+
+  typescript@6.0.3:
+    resolution: {integrity: sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw==}
+    engines: {node: '>=14.17'}
+    hasBin: true
+
+  undici-types@7.18.2:
+    resolution: {integrity: sha512-AsuCzffGHJybSaRrmr5eHr81mwJU3kjw6M+uprWvCXiNeN9SOGwQ3Jn8jb8m3Z6izVgknn1R0FTCEAP2QrLY/w==}
+
+snapshots:
+
+  '@types/node@24.13.3':
+    dependencies:
+      undici-types: 7.18.2
+
+  typescript@6.0.3: {}
+
+  undici-types@7.18.2: {}

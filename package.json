@@ -1,0 +1,75 @@
+{
+  "name": "@aubwang/dsh-consult",
+  "description": "Delegation capability seam for DeepSeek Harness, provided by the consult CLI: model-facing delegate/review/status/result/logs tools over background consult jobs",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./seam": {
+      "types": "./lib/types/seam.d.ts",
+      "default": "./lib/seam.js"
+    },
+    "./provider": {
+      "types": "./lib/types/provider.d.ts",
+      "default": "./lib/provider.js"
+    },
+    "./tools": {
+      "types": "./lib/types/tools.d.ts",
+      "default": "./lib/tools.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/**/*.js",
+    "lib/types/**/*.d.ts",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/dsh-agent": "0.1.0-rc.7",
+    "@deepseek-ai/dsh-jobs": "0.1.0-rc.7",
+    "@deepseek-ai/dsh-llm": "0.1.0-rc.7",
+    "@deepseek-ai/dsh-subprocess": "0.1.0-rc.7",
+    "@deepseek-ai/dsh-tools": "0.1.0-rc.7",
+    "@deepseek-ai/schemastery": "3.18.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-jobs": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "link:../dev/deepseek-harness/vendor/cordis",
+    "@deepseek-ai/dsh-agent": "link:../dev/deepseek-harness/packages/core/agent",
+    "@deepseek-ai/dsh-jobs": "link:../dev/deepseek-harness/packages/jobs/jobs",
+    "@deepseek-ai/dsh-jobs-local": "link:../dev/deepseek-harness/packages/jobs/jobs-local",
+    "@deepseek-ai/dsh-llm": "link:../dev/deepseek-harness/packages/llm/llm",
+    "@deepseek-ai/dsh-session": "link:../dev/deepseek-harness/packages/core/session",
+    "@deepseek-ai/dsh-subprocess": "link:../dev/deepseek-harness/packages/subprocess/subprocess",
+    "@deepseek-ai/dsh-subprocess-local": "link:../dev/deepseek-harness/packages/subprocess/subprocess-local",
+    "@deepseek-ai/dsh-tools": "link:../dev/deepseek-harness/packages/core/tools",
+    "@deepseek-ai/schemastery": "link:../dev/deepseek-harness/vendor/schemastery",
+    "@types/node": "^24.0.0",
+    "typescript": "6.0.3"
+  }
+}
