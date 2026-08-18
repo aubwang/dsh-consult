@@ -24,6 +24,7 @@
  *   FAKE_CONSULT_LOG_LINES      lines the transcript starts with               (default 3)
  *   FAKE_CONSULT_LOG_GROW       lines the transcript gains per `logs` call     (default 0)
  *   FAKE_CONSULT_NO_EVENTS      '1' removes the `events` command (a pre-report consult build)
+ *   FAKE_CONSULT_NO_STEER       '1' removes the `steer` command (a pre-steer consult build)
  *   FAKE_CONSULT_EVENTS         JSON array of raw events served by `events`   (default: a full job)
  *   FAKE_CONSULT_EVENT_STEP_MS  delay between streamed follow events          (default 40)
  *   FAKE_CONSULT_FOLLOW_DIE_AFTER  events the FIRST follow emits before exiting 4
@@ -90,6 +91,9 @@ switch (command) {
   case 'events':
     await events()
     break
+  case 'steer':
+    steer()
+    break
   case 'cancel':
     if (forced !== undefined) exitWith(forced, 'cancel failed\n')
     out(`cancelled ${argv[1]}\n`)
@@ -152,6 +156,36 @@ async function events() {
   }
   if (emitted >= dieAt) exitWith(4, `timed out following job ${jobId}\n`)
   exit(0)
+}
+
+function steer() {
+  if (process.env.FAKE_CONSULT_NO_STEER === '1') exitWith(2, 'unknown subcommand: steer\n')
+  if (argv.includes('--help')) {
+    out('Usage:\n  consult steer <job-id> --message <text>\n')
+    exit(0)
+  }
+  const jobId = argv[1]
+  if (jobId === undefined || jobId.startsWith('--')) exitWith(2, 'job id is required\n')
+  const guidance = flagValue('--message') ?? argv[argv.indexOf('--') + 1]
+  if (guidance === undefined || guidance.length === 0) exitWith(2, 'guidance is required\n')
+  // Rejected, never trimmed — the same rule the real CLI applies.
+  const bytes = Buffer.byteLength(guidance)
+  if (bytes > 16384) exitWith(2, `guidance is ${bytes} bytes; the limit is 16384\n`)
+  if (forced !== undefined) {
+    exitWith(forced, steerStderr(forced))
+  }
+  out(`steered ${jobId}\n`)
+  exit(0)
+}
+
+// The exact stderr shapes the real CLI emits per exit family.
+function steerStderr(code) {
+  return {
+    1: 'steer is not available for job job-1 (inline runner); cancel and re-delegate with the guidance in the prompt\n',
+    2: 'job not found\n',
+    3: 'STEER_PENDING: a previous steer is still being delivered\n',
+    5: 'job already finalized; cannot steer (status=completed)\n',
+  }[String(code)] ?? 'steer failed\n'
 }
 
 function doctor() {

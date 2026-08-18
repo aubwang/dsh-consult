@@ -458,3 +458,85 @@ describe('delegation event delivery', () => {
     assert.equal(owner.injected.length, delivered, 'a collected delegation delivers nothing further')
   })
 })
+
+describe('delegate_steer', () => {
+  it('reports delivered guidance and tells the model not to resend it', async () => {
+    const harness = await setup()
+    const result = await harness.call('delegate_steer', { job_id: 'job-1', guidance: 'skip the migration' })
+    const steered = value(result)
+    assert.deepEqual(steered.kind, 'steer')
+    assert.equal(steered.outcome, 'accepted')
+    const rendered = text(result)
+    assert.match(rendered, /keeps its id/)
+    assert.match(rendered, /Do not re-send the same guidance/)
+  })
+
+  it('explains a refusal that might clear, and points at the check', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_EXIT_STEER: '3' } })
+    const result = await harness.call('delegate_steer', { job_id: 'job-1', guidance: 'go left' })
+    assert.equal(value(result).outcome, 'refused')
+    const rendered = text(result)
+    assert.match(rendered, /STEER_PENDING/)
+    assert.match(rendered, /delegate_status job-1/)
+    assert.match(rendered, /do not resend in a loop/)
+  })
+
+  it('explains a refusal that will never clear, and names the way out', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_EXIT_STEER: '1' } })
+    const result = await harness.call('delegate_steer', { job_id: 'job-1', guidance: 'go left' })
+    assert.equal(value(result).outcome, 'unsupported')
+    const rendered = text(result)
+    assert.match(rendered, /cannot be steered at all/)
+    assert.match(rendered, /job_kill/)
+    assert.match(rendered, /delegate again/)
+  })
+
+  it('reports a consult with no steer command as unsupported, not as a missing tool', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_NO_STEER: '1' } })
+    const result = await harness.call('delegate_steer', { job_id: 'job-1', guidance: 'go left' })
+    assert.equal(result.isError, false)
+    assert.equal(value(result).outcome, 'unsupported')
+    assert.match(text(result), /no `steer` command/)
+  })
+
+  it('is registered even against a consult that cannot serve it', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_NO_STEER: '1' } })
+    assert.ok(harness.ctx.tools.schemas().some((schema) => schema.name === 'delegate_steer'))
+  })
+
+  it('rejects guidance that is empty or over consult\'s bound', async () => {
+    const harness = await setup()
+    assert.equal((await harness.call('delegate_steer', { job_id: 'job-1', guidance: '   ' })).isError, true)
+    const oversized = await harness.call('delegate_steer', { job_id: 'job-1', guidance: 'x'.repeat(16 * 1024 + 1) })
+    assert.equal(oversized.isError, true)
+    assert.equal(harness.invocations().some((entry) => entry.argv[0] === 'steer' && entry.argv[1] === 'job-1'), false)
+  })
+
+  it('surfaces a preflight failure as a domain outcome', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_VERSION: '0.12.0' } })
+    const result = await harness.call('delegate_steer', { job_id: 'job-1', guidance: 'go left' })
+    assert.equal(result.isError, false)
+    assert.equal(value(result).code, 'not-ready')
+  })
+
+  it('never notifies the supervisor about its own steer', async () => {
+    const harness = await setup({
+      scenario: {
+        FAKE_CONSULT_EVENT_STEP_MS: '20',
+        FAKE_CONSULT_DELAY_MS: '5000',
+        FAKE_CONSULT_EVENTS: JSON.stringify([
+          { kind: 'steer', type: 'steer', at: 'a', seq: 1, message: 'skip the migration' },
+          { kind: 'report', type: 'discovery', at: 'b', seq: 2, message: 'a second call site exists' },
+          { kind: 'lifecycle', type: 'terminal', at: 'c', status: 'completed' },
+        ]),
+      },
+    })
+    const owner = harness.owner('session-steer', { status: 'idle' })
+    await harness.call('delegate', { prompt: 'p' }, owner.agent)
+    await until(() => owner.injected.length + owner.followedUp.length > 0 ? true : undefined)
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const all = [...owner.injected, ...owner.followedUp]
+    assert.equal(all.length, 1, 'the discovery report, and not the steer echo')
+    assert.match(String((all[0]?.content[0] as { text: string }).text), /reported: discovery/)
+  })
+})
