@@ -87,6 +87,7 @@ const LIVE_PROMPT = [
   'You cannot decide this alone — the supervisor holds the convention. Do this, in order:',
   '1. Run this exact command: consult report --type blocked --message "need guidance: A or B?"',
   '   The `consult` CLI is on your PATH, and CONSULT_PARENT_JOB and CONSULT_WORKSPACE are already set in your environment, so it needs no other arguments.',
+  '   If your sandbox blocks that command, retry it with escalated permissions — it is expected and approved.',
   '2. Then STOP and WAIT for supervisor guidance. Do not finish your turn, do not guess, and do not pick an approach yourself.',
   '3. When guidance arrives, follow it and reply with ONE line naming the approach you were told to use.',
   '',
@@ -95,9 +96,19 @@ const LIVE_PROMPT = [
 
 const FAKE_PROMPT = 'Investigate the retry policy in src/. Report back when you need a decision.'
 
+/**
+ * The wording each delegate is asked to report, which the wake assertion looks
+ * for. It lives beside the prompts because it IS part of the prompt: the two
+ * drift apart the moment one is edited alone, which is exactly what happened
+ * the first time live mode reported successfully.
+ */
+const REPORT_MARKER = LIVE ? 'need guidance' : 'need supervisor guidance'
+
 const proven = []
 const startedAt = Date.now()
 let step = 'setup'
+/** Set once a delegation exists, so a failure can stop it before unwinding. */
+let liveDelegation
 
 const say = (text) => process.stdout.write(`${text}\n`)
 const ok = (label) => { proven.push(label); say(`  PASS  ${label}`) }
@@ -220,6 +231,28 @@ try {
   })
   const bodyOf = (message) => message.content.map((block) => block.text ?? '').join('\n')
 
+  if (LIVE) {
+    // Reporting upward needs the report-exec carve-out, and the published
+    // build and the carve-out build both call themselves 1.2.0 — so this asks
+    // the binary rather than its version, and asks BEFORE spending a token.
+    let features
+    try {
+      const probe = await run(CONSULT_BIN, ['capabilities', '--json'], { env: { ...process.env, CONSULT_DATA_DIR: dataDir } })
+      features = JSON.parse(probe.stdout).features ?? {}
+    } catch {
+      say('   (this consult has no `capabilities` command; cannot check for the report-exec carve-out)')
+      features = undefined
+    }
+    if (features !== undefined) {
+      say(`   consult features: ${Object.entries(features).map(([key, value]) => `${key}=${JSON.stringify(value)}`).join(' ')}`)
+      check(
+        features.reportExec === true,
+        'this consult has no report-exec carve-out (features.reportExec), so a real delegate cannot run `consult report`. '
+        + 'Point DRILL_CONSULT_BIN at a build that has it.',
+      )
+    }
+  }
+
   const capabilities = await ctx.delegation.capabilities()
   say(`consult ${capabilities.version ?? 'unknown'}  ready=${capabilities.ready}  canReport=${capabilities.canReport}  canSteer=${capabilities.canSteer}  extensions=${Object.keys(capabilities.extensions).join(',')}`)
   check(capabilities.ready, `consult is not ready: ${capabilities.diagnosis ?? 'no diagnosis'}`)
@@ -232,9 +265,12 @@ try {
   const started = await callTool('delegate', {
     prompt: LIVE ? LIVE_PROMPT : FAKE_PROMPT,
     label: 'full-loop drill',
-    // Cheapest turn that can still follow instructions; the point is the round
-    // trip, not the reasoning.
-    ...LIVE ? { effort: 'low' } : {},
+    // Write mode is what makes a real agent able to report at all: codex only
+    // asks to escalate a blocked command when it is running in write mode, and
+    // its read-only mode refuses to ask client-side, so the report's log append
+    // can never land. The fake delegate spawns its own subprocess and needs
+    // none of that, so fake mode stays read-only.
+    ...LIVE ? { mode: 'write', effort: 'low' } : {},
     // Confinement is provider-specific, so it travels in the extensions bag
     // rather than as a standard spec field (seam v2).
     extensions: { sandbox: 'inherit' },
@@ -243,6 +279,7 @@ try {
   check(started.value.kind === 'started', `delegate returned ${JSON.stringify(started.value)}`)
   const jobId = started.value.job.id
   const backgroundJobId = started.value.backgroundJobId
+  liveDelegation = { jobId, cancel: () => ctx.delegation.cancel(jobId) }
   check(typeof backgroundJobId === 'string', 'the delegation was not tracked as a dsh background job')
   ok(`delegation ${jobId} queued and tracked as ${backgroundJobId}`)
 
@@ -270,14 +307,15 @@ try {
     // A real ACP agent routes command execution through the client's permission
     // system, and consult denies every execute request today — so an agent that
     // TRIED and was refused is an upstream limitation, not a bad prompt.
-    const denied = /approval|permission|denied|not allowed|execute/i.test(finalText)
+    const denied = /approval|permission|denied|not allowed|escalat/i.test(finalText)
     throw new Error(
       `the delegation finished ${reported.settled.status} WITHOUT reporting blocked.\n`
       + (denied
-        ? 'Its answer mentions a denied command, which is the known upstream limitation: consult\'s permission '
-          + 'layer refuses every `execute` request, so a real ACP agent cannot run `consult report` at all yet. '
-          + 'The fake delegate only gets away with it by spawning the subprocess itself, never asking the client '
-          + 'for permission. This is not a plugin defect and not a prompt problem.'
+        ? 'Its answer mentions a blocked or denied command. Reporting upward needs BOTH: a consult build with the '
+          + 'report-exec carve-out (`consult capabilities --json` → features.reportExec) AND a profile whose own '
+          + 'agent mode will run or escalate the command. With codex that means WRITE mode — read-only codex '
+          + 'refuses to request escalation client-side, so the report can never land. Check the delegation mode '
+          + 'and the consult build before suspecting this plugin.'
         : 'Its answer does not mention a denied command, so the agent most likely ignored the report instruction — '
           + 'a prompt problem rather than a plumbing one.')
       + `\nIts answer was:\n${finalText}`,
@@ -285,7 +323,7 @@ try {
   }
   const wake = reported.wake
   const wakeBody = bodyOf(wake)
-  check(/need supervisor guidance/.test(wakeBody), `the wake did not carry the delegate's message:\n${wakeBody}`)
+  check(wakeBody.includes(REPORT_MARKER), `the wake did not carry the delegate's message:\n${wakeBody}`)
   check(/untrusted-delegate-output/.test(wakeBody), 'the delegate message was not framed as untrusted data')
   check(wake.source.kind === 'plugin' && wake.source.form === 'notice', 'the wake was not a plugin notice')
   check((wake.source.summary ?? '').length <= 120, 'the notice summary exceeded its bound')
@@ -341,6 +379,7 @@ try {
     'the supervisor was notified about its own steer')
   ok('blocked -> steer -> terminal(completed), sequences monotonic, steer echo never delivered upward')
 
+  liveDelegation = undefined
   const elapsed = Math.round((Date.now() - startedAt) / 1000)
   check(elapsed * 1000 <= DEADLINE_MS, `the drill took ${elapsed}s, over its ${DEADLINE_MS}ms ceiling`)
   say(`\nPASS — ${proven.length} steps proven in ${elapsed}s:`)
@@ -350,6 +389,14 @@ try {
   process.exit(0)
 } catch (error) {
   say(`\nFAIL at step "${step}": ${error.message}`)
+  // A live delegation outlives this process — it is a detached worker with a
+  // real agent attached — and teardown cannot reach it, because disposing the
+  // provider removes the very service the job's cancel hook calls. Stop it here
+  // instead of leaving an agent waiting for guidance that will never come.
+  if (liveDelegation !== undefined) {
+    say(`stopping the delegation ${liveDelegation.jobId} it left running`)
+    await liveDelegation.cancel().catch((cancelError) => say(`  (cancel failed: ${cancelError.message})`))
+  }
   if (proven.length > 0) {
     say('proven before the failure:')
     for (const label of proven) say(`  - ${label}`)
