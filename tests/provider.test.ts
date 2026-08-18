@@ -575,3 +575,67 @@ describe('steer()', () => {
     assert.equal(page.nextSeq, 2, 'steers share the report sequence space')
   })
 })
+
+describe('reconciliation at preflight', () => {
+  it('counts only the delegations that are still live', async () => {
+    const harness = await setup({ FAKE_CONSULT_ACTIVE_JOBS: '2', FAKE_CONSULT_FINAL_JOBS: '1' })
+    const capabilities = await harness.delegation.capabilities()
+    assert.equal(capabilities.activeFromEarlierSessions, 2)
+    // Reconciliation runs inside the successful preflight, BEFORE this session
+    // has delegated anything, which is what makes every active job necessarily
+    // someone else's.
+    assert.deepEqual(of(harness, 'status')[0]?.argv, ['status', '--all', '--json'])
+  })
+
+  it('stays silent when nothing was left running', async () => {
+    const harness = await setup({ FAKE_CONSULT_FINAL_JOBS: '3' })
+    const capabilities = await harness.delegation.capabilities()
+    assert.equal(capabilities.activeFromEarlierSessions, undefined, 'zero is absent, not a zero to report')
+  })
+
+  it('sweeps stale broker records in the same pass', async () => {
+    const harness = await setup({ FAKE_CONSULT_ACTIVE_JOBS: '1' })
+    await harness.delegation.capabilities()
+    assert.deepEqual(of(harness, 'brokers').map((entry) => entry.argv), [['brokers', '--cleanup']])
+  })
+
+  it('ignores a sweep that fails', async () => {
+    const harness = await setup({ FAKE_CONSULT_ACTIVE_JOBS: '1', FAKE_CONSULT_EXIT_BROKERS: '3' })
+    const capabilities = await harness.delegation.capabilities()
+    assert.equal(capabilities.ready, true, 'a failed sweep must never make delegation unavailable')
+    assert.equal(capabilities.activeFromEarlierSessions, 1)
+  })
+
+  it('ignores a consult with no brokers command at all', async () => {
+    const harness = await setup({ FAKE_CONSULT_ACTIVE_JOBS: '1', FAKE_CONSULT_NO_BROKERS: '1' })
+    const capabilities = await harness.delegation.capabilities()
+    assert.equal(capabilities.ready, true)
+    assert.equal(capabilities.activeFromEarlierSessions, 1)
+  })
+
+  it('reports nothing rather than guessing when the listing is unreadable', async () => {
+    const harness = await setup({ FAKE_CONSULT_EXIT_STATUS: '2' })
+    const capabilities = await harness.delegation.capabilities()
+    assert.equal(capabilities.ready, true, 'an unreadable listing is not a readiness failure')
+    assert.equal(capabilities.activeFromEarlierSessions, undefined)
+  })
+
+  it('reconciles once per healthy preflight, not once per call', async () => {
+    const harness = await setup({ FAKE_CONSULT_ACTIVE_JOBS: '2' })
+    await harness.delegation.capabilities()
+    const after = of(harness, 'status').length
+    await harness.delegation.capabilities()
+    await harness.delegation.status()
+    await harness.delegation.logs('job-1', 5)
+    assert.equal(of(harness, 'status').filter((entry) => entry.argv.includes('--all')).length, 1)
+    assert.ok(of(harness, 'status').length > after, 'the ordinary status call still ran')
+  })
+
+  it('does not reconcile while preflight is failing', async () => {
+    const harness = await setup({ FAKE_CONSULT_ACTIVE_JOBS: '2', FAKE_CONSULT_DOCTOR_OK: '0' })
+    const capabilities = await harness.delegation.capabilities()
+    assert.equal(capabilities.ready, false)
+    assert.equal(capabilities.activeFromEarlierSessions, undefined)
+    assert.equal(of(harness, 'status').length, 0)
+  })
+})

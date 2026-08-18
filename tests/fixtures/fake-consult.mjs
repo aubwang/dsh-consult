@@ -25,6 +25,9 @@
  *   FAKE_CONSULT_LOG_GROW       lines the transcript gains per `logs` call     (default 0)
  *   FAKE_CONSULT_NO_EVENTS      '1' removes the `events` command (a pre-report consult build)
  *   FAKE_CONSULT_NO_STEER       '1' removes the `steer` command (a pre-steer consult build)
+ *   FAKE_CONSULT_NO_BROKERS     '1' removes the `brokers` command (an old consult build)
+ *   FAKE_CONSULT_ACTIVE_JOBS    jobs `status --all` reports as queued/running   (default 0)
+ *   FAKE_CONSULT_FINAL_JOBS     jobs `status --all` reports as completed        (default 0)
  *   FAKE_CONSULT_EVENTS         JSON array of raw events served by `events`   (default: a full job)
  *   FAKE_CONSULT_EVENT_STEP_MS  delay between streamed follow events          (default 40)
  *   FAKE_CONSULT_FOLLOW_DIE_AFTER  events the FIRST follow emits before exiting 4
@@ -93,6 +96,12 @@ switch (command) {
     break
   case 'steer':
     steer()
+    break
+  case 'brokers':
+    if (process.env.FAKE_CONSULT_NO_BROKERS === '1') exitWith(2, 'unknown subcommand: brokers\n')
+    if (forced !== undefined) exitWith(forced, 'brokers failed\n')
+    out('(no brokers)\n')
+    exit(0)
     break
   case 'cancel':
     if (forced !== undefined) exitWith(forced, 'cancel failed\n')
@@ -209,6 +218,20 @@ function doctor() {
 function status() {
   const id = argv[1] !== undefined && !argv[1].startsWith('--') ? argv[1] : undefined
   if (forced !== undefined) exitWith(forced, 'status failed\n')
+  if (id === undefined && argv.includes('--all')) {
+    // The reconciliation listing: a controllable mix of live and finished jobs.
+    const active = Number(process.env.FAKE_CONSULT_ACTIVE_JOBS ?? '0')
+    const final = Number(process.env.FAKE_CONSULT_FINAL_JOBS ?? '0')
+    const jobs = []
+    for (let index = 1; index <= active; index += 1) {
+      jobs.push(payload({ id: `old-active-${index}`, status: index % 2 === 0 ? 'queued' : 'running' }))
+    }
+    for (let index = 1; index <= final; index += 1) {
+      jobs.push(payload({ id: `old-final-${index}`, status: 'completed' }))
+    }
+    out(`${JSON.stringify({ schemaVersion: schemaVersion(), jobs })}\n`)
+    exit(0)
+  }
   if (id === undefined) {
     out(`${JSON.stringify({
       schemaVersion: schemaVersion(),
