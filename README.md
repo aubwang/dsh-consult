@@ -16,6 +16,8 @@ The tools talk **only** to `ctx.delegation`. Nothing in `tools.ts` knows that co
 
 ## Install
 
+> **Not installable from npm yet.** The published `@deepseek-ai/dsh-*` packages lag the harness repo (`0.0.1-rc.1` against the `0.1.0-rc.7` this builds against), so there is no released dsh a registry install would resolve against. Until those catch up, build this package from source against a local harness checkout — see [Development setup](#development-setup). The `dsh plugin add` path below is what the install becomes once they do.
+
 ```sh
 dsh plugin --profile <name> add @aubwang/dsh-consult
 ```
@@ -49,11 +51,11 @@ Deliberately **not** tools: waiting and killing. A tracked delegation is an ordi
 
 #### What the model sees
 
-Five tool schemas while the plugin is visible. `delegate`'s description carries the whole handoff contract in one place: the delegate sees none of the host conversation, so the prompt must be cold; delegation is always background and notifies on completion; concurrency stays small; and everything a delegate reports back is data to evaluate rather than instructions to follow.
+Six tool schemas while the plugin is visible — `delegate_steer` registers unconditionally, so the count does not change with the mounted consult's capabilities. `delegate`'s description carries the whole handoff contract in one place: the delegate sees none of the host conversation, so the prompt must be cold; delegation is always background and notifies on completion; concurrency stays small; and everything a delegate reports back is data to evaluate rather than instructions to follow.
 
 #### Token effect
 
-Fixed input cost per request while the tools are visible — roughly 700 tokens for the five schemas, dominated by `delegate`.
+Fixed input cost per request while the tools are visible. Measured against the real registry, the six schemas serialize to **5,576 characters** — roughly 1,400 tokens at the usual four-characters-per-token estimate, so treat it as an order of magnitude rather than a budget line. `delegate` (1,963) and `delegate_review` (1,270) are more than half of it; `delegate_status` is 356.
 
 #### KV Cache effect
 
@@ -116,6 +118,8 @@ One bounded notice per delegation, capped by `outputLimitBytes` (default 16 KB) 
 
 ### Delegate reports (requires a consult with `report`/`events`)
 
+> **Mid-flight reports need `sandbox: 'inherit'` today.** `consult report` is a command the delegate has to run, and a confined delegation is denied every execute kind, so a confined delegate cannot report at all. Confined delivery is upstream future work; until then, a delegation you want to hear from mid-turn must be granted inherited authority deliberately.
+
 #### What the supervisor sees
 
 A delegate that calls `consult report` mid-turn reaches its supervisor without waiting for the delegation to end. Each report arrives as a plugin notice whose body frames the delegate's own words as untrusted data:
@@ -137,6 +141,8 @@ delegation, which keeps its id and its budget. If the steer comes back refused o
 with job_kill and delegate again with the answer written into the new prompt. Transcript: delegate_logs job-7.
 ```
 
+What a delegate *says* is out of scope for this plugin. Every report is framed and bounded as untrusted data, but a hostile or confused delegate can still write a plausible `decision_needed` that is really social engineering; deciding whether to act on report CONTENT is supervisor-side policy, and belongs in a policy plugin consuming the same seam rather than in the transport that carries it.
+
 The closing paragraph is capability-aware. Against a steer-capable consult it leads with `delegate_steer`, because redirecting in place keeps the delegation's id, session, and budget, and names the destructive path only as the fallback. Against a consult without `steer` it says the delegation cannot be redirected in place and gives cancel-and-re-delegate as the only advice — a notice never advertises a tool the composition cannot serve.
 
 **Which lane a report takes** is decided by its type, because urgency is a property of what the delegate said rather than of who is listening:
@@ -152,7 +158,7 @@ The closing paragraph is capability-aware. Against a steer-capable consult it le
 
 Lifecycle transitions are dropped on purpose: `dsh-tool-jobs` already announces the completion of the background job tracking this delegation, and a second terminal notice would spend a step to say the same thing twice. Steer echoes are dropped for the same class of reason: the supervisor sent them.
 
-Waking is bounded by `wakeBudget`, for the same reason `dsh-tool-jobs` bounds its own: the chain is self-exciting, since a woken turn may start the delegation whose next report wakes it again. Any user-authored inbox claim refills the budget. The two budgets are separate counters — one bounds completion notices, the other bounds mid-flight reports.
+Waking is bounded by `wakeBudget`, for the same reason `dsh-tool-jobs` bounds its own: the chain is self-exciting, since a woken turn may start the delegation whose next report wakes it again. Any user-authored inbox claim refills the budget, because a user message means a human is back in the loop — the runaway the budget exists to bound is an agent waking *itself* unattended, and that is exactly what has stopped happening. The two budgets are separate counters — one bounds completion notices, the other bounds mid-flight reports.
 
 #### Token effect
 
@@ -206,6 +212,7 @@ A consuming delta of the delegation's rendered transcript, in the same untrusted
 | `logTailLines` | `40` | rendered lines returned when a caller does not ask for a tail |
 | `waitTimeoutMs` | `1500000` | bound for one seam `wait` before it reports `timeout` |
 | `eventFollowRestartMs` | `2000` | delay before restarting an event follow that died while its delegation was still live |
+| `preflightRetryMs` | `30000` | how long a FAILED preflight is cached before re-probing; `0` re-probes every call |
 | `graceMs` | `5000` | SIGTERM→SIGKILL grace for every consult invocation |
 | `env` | – | environment forwarded past the subprocess credential scrub |
 
@@ -227,8 +234,9 @@ A consuming delta of the delegation's rendered transcript, in the same untrusted
 
 - **Every spawn goes through `ctx.subprocess.spawn`** — never `node:child_process` — so confinement, the credential scrub, bounded collection with spill, tree-kill escalation, and remote execution worlds apply to delegated work exactly as they do to the bash tool.
 - **Host identity is stamped per spawn.** `CONSULT_HOST=dsh` plus `CONSULT_HOST_SESSION_ID=<calling agent's session id>` scope consult's job records to the agent that started them; without them every agent's jobs would collapse into consult's `terminal/default` host session. The session id reaches the provider through the seam's per-call `DelegationCallOptions`, which the tools fill from `exec.agent`.
-- **Preflight is lazy and memoized.** First use runs `consult --version` (gated at `>=1.0.0 <2.0.0`), then `consult doctor --json` **with the configured authority** (`--read-only`/`--write` and `--sandbox <configured>`, because doctor checks exactly one authority and defaults to consult's own), then `consult agents --json`. A healthy probe is cached; any not-ready outcome clears the cache so the next call re-probes after you fix the install. A missing, stale, or unconfigured consult becomes a `not-ready` domain outcome quoting doctor's own diagnosis — it never crashes the plugin.
+- **Preflight is lazy and memoized.** First use runs `consult --version` (gated at `>=1.0.0 <2.0.0`), then `consult doctor --json` **with the configured authority** (`--read-only`/`--write` and `--sandbox <configured>`, because doctor checks exactly one authority and defaults to consult's own), then `consult agents --json`, then one reconciliation pass (below). A healthy probe is cached indefinitely; a not-ready one is cached for `preflightRetryMs` (default 30s) and then re-probed, because doctor really launches the profile and a model retrying `delegate` in a loop must not pay that cost per attempt. A missing, stale, or unconfigured consult becomes a `not-ready` domain outcome quoting doctor's own diagnosis — it never crashes the plugin.
 - **Exit codes map to domain outcomes.** `3` is retried exactly once and then reported as `busy`; `4` → `timeout`; `5` → `not-final`; `6` → `delegate-failed`; `8` → `review-unsupported`; `1` and anything unexpected → `internal`. `2` is deliberately an infrastructure throw: every argv is plugin-authored, so a usage error means the plugin or its configuration is wrong.
+- **Preflight also reconciles the workspace once.** On the successful probe it runs `consult status --all --json` and counts what is still queued or running. The timing carries the argument: the pass runs before this session has delegated anything, so every active job it finds necessarily belongs to an earlier session — no bookkeeping needed. It surfaces and does not reap; see the crashed-session entry under Known Limitations for exactly what is and is not done.
 - **Only `schemaVersion: 1` envelopes are trusted.** Unknown fields are ignored so the contract can evolve additively; an unknown schema version is refused rather than half-parsed. Non-job JSON (`doctor`, `agents`) is defensively parsed and never fatal.
 - **The plugin never reads consult's private state.** The CLI is the whole contract; the only paths it touches are the ones an envelope hands back.
 - **Optional commands are capability-gated at runtime, not by version number.** `report`/`events` and `steer` all landed in consult after 1.0.0 was cut, so two builds both reporting `1.0.0` differ on whether they have them. Preflight settles it by running the command's own `--help`: it exits 0 when the command exists and 2 when the subcommand is unknown. It touches no job, no workspace state, and no profile. A consult without `events` reports `canReport: false`, returns a typed unsupported page, and spawns no follow process; one without `steer` reports `canSteer: false` and answers `delegate_steer` with an `unsupported` outcome. Delegation itself is unaffected either way.
@@ -292,7 +300,7 @@ pnpm dsh --profile headless --patch /home/dev/dsh-consult/drill/smoke.patch.yml 
 # (any credential gets past the LLM row; the probe exits before a request):
 DEEPSEEK_API_KEY=<anything> pnpm dsh --profile headless \
   --patch /home/dev/dsh-consult/drill/smoke.patch.yml "probe"
-# → [drill] delegation tools: delegate, delegate_logs, delegate_result, delegate_review, delegate_status
+# → [drill] delegation tools: delegate, delegate_logs, delegate_result, delegate_review, delegate_status, delegate_steer
 ```
 
 `drill/full-loop.mjs` is the end-to-end proof, documented in [Full-loop drill](#full-loop-drill) above.
@@ -362,6 +370,7 @@ PASS — 5 steps proven in 3s
 - **`job_output` transcript reads are polled, not pushed.** The jobs seam's `readOutput` hook is synchronous while the delegation seam exposes the transcript as an asynchronous bounded tail, so background collection refreshes it on a `logPollIntervalMs` timer and on each read. Each refresh spawns one short-lived `consult logs`. The event stream did NOT replace this: events carry what a delegate deliberately reports, while the transcript carries its tool activity, and only the transcript answers `job_output`. Folding the two into one follow process is a plausible future simplification, not something the event work delivered.
 - **The transcript cursor can report a gap.** It anchors on the last line already delivered; if more than `logWindowLines` lines are rendered between refreshes, the anchor slides out of the window and the read is marked as a gap rather than replaying or skipping silently. Widen the window or shorten the poll for very chatty delegates; the full transcript is always available through `delegate_logs`.
 - **Confined delegations cannot execute anything.** That is consult's own boundary, not this plugin's: confined jobs are denied every execute kind, so a delegate cannot run tests or builds. Verify a returned patch host-side, or grant `sandbox: 'inherit'` deliberately.
+- **Delegations from a crashed session are surfaced, not reclaimed.** Delegation state is durable, so a host crash leaves consult jobs running with nobody listening. The first successful preflight counts them (`capabilities().activeFromEarlierSessions`) and the first delegation-family tool call defers one bounded notice about them. That is the whole of it: they are **not adopted** — a host background job needs a live owner agent at registration time and theirs is gone, so `job_output`/`job_kill` cannot reach them and no completion notice will ever arrive; their upward **reports are not delivered**, since nothing is following them; and nothing is **auto-cancelled**. They stay readable through `delegate_status`/`delegate_result`/`delegate_logs`, and consult's own wall-clock bound ends them. The same pass runs `consult brokers --cleanup`, which sweeps stale broker *records* only — broker processes already self-terminate.
 - **Preflight answers for one authority.** Doctor checks a single authority, so preflight asks about the deployment's configured `defaultMode`/`sandbox`. A per-call `mode` or `sandbox` that differs from the configured default is not preflighted; consult still enforces it at delegate time, and a rejected combination surfaces there rather than as `not-ready`.
 - **The full-loop drill needs unix sockets.** consult's background worker talks to a job-scoped broker over one, so a sandbox that denies `listen(2)` leaves delegations silently `queued`. Unit and integration tests are unaffected — they never reach the broker.
 - **Preflight runs `consult doctor`, which really launches the profile.** It stages a credential and initializes/disposes the agent (it sends no model prompt). That is a real cost on first use; it is memoized until it fails.
