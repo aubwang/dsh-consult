@@ -9,22 +9,32 @@
  * Every text field that can reach the model is bounded by the provider before
  * it crosses this seam, and delegate-authored text is untrusted data: a
  * consumer frames it as data, never as instructions.
+ *
+ * ## Seam evolution
+ *
+ * **v2 (2026-08-18).** Writing a second, dsh-native provider was the forcing
+ * function: several fields turned out to describe consult rather than
+ * delegation. `sandbox` and `isolated` left {@link DelegateSpec} for the
+ * provider-interpreted {@link DelegateSpec.extensions} bag, since OS
+ * confinement and detached git worktrees are one provider's vocabulary and were
+ * reaching the model in a tool schema. {@link DelegationService.review} became
+ * optional, because pinning a git ref is a capability a provider may simply not
+ * have rather than one it must apologize for. `unknown-job` became a real
+ * {@link DelegationErrorCode} instead of a convention both providers had
+ * independently invented. {@link DelegationJob.profile} and `mode` became
+ * optional, so a provider with one delegate and no authority axis stops
+ * inventing values to satisfy a type.
  * @module @aubwang/dsh-consult/seam
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
+import type { JsonValue } from '@deepseek-ai/dsh-session'
 
 /** Provider-issued identifier for one delegated turn. */
 export type DelegationJobId = string
 
 /** The authority a delegated turn is granted over the workspace. */
 export type DelegationMode = 'read-only' | 'write'
-
-/**
- * Whether the provider imposes its own OS boundary (`confined`) or runs the
- * delegate under the host's ambient authority (`inherit`).
- */
-export type DelegationSandbox = 'confined' | 'inherit'
 
 /**
  * Lifecycle of one delegated turn. `unknown` is the honest projection of a
@@ -40,16 +50,31 @@ export type DelegationStatus =
   | 'skipped'
   | 'unknown'
 
+/**
+ * Provider-interpreted options that are not part of the standard vocabulary.
+ *
+ * Anything only some providers can mean belongs here rather than in the core
+ * spec, which is how OS confinement and detached worktrees stopped being
+ * standard fields in v2. A provider declares the keys it understands through
+ * {@link DelegationCapabilities.extensions}, and the recommended behavior is to
+ * REJECT a key it does not understand with a typed error: silently ignoring one
+ * turns a supervisor's typo into an authority it believes it granted.
+ */
+export type DelegationExtensions = Record<string, JsonValue>
+
 /** One delegation request: a cold prompt plus the authority it runs under. */
 export interface DelegateSpec {
   /** The complete self-contained prompt; the delegate sees no host conversation. */
   prompt: string
   /** Provider-interpreted delegate identity (a consult profile id). */
   profile?: string
-  /** Workspace authority; defaults to the provider's configured default. */
+  /**
+   * Whether the delegate may change the workspace. Standard because "may this
+   * delegation mutate anything" is a question every delegation answers; a
+   * provider with no write path rejects `write` with an `unsupported` error
+   * rather than quietly downgrading it.
+   */
   mode?: DelegationMode
-  /** Run in a detached seeded worktree and return a patch. Requires `mode: 'write'`. */
-  isolated?: boolean
   /** Prerequisite jobs; a failed prerequisite skips this job. */
   after?: readonly DelegationJobId[]
   /** Non-unique human metadata carried on the job record. */
@@ -58,11 +83,18 @@ export interface DelegateSpec {
   model?: string
   /** Provider-interpreted reasoning-effort level. */
   effort?: string
-  /** Confinement override; defaults to the provider's configured default. */
-  sandbox?: DelegationSandbox
+  /** Provider-interpreted options; see {@link DelegationExtensions}. */
+  extensions?: DelegationExtensions
 }
 
-/** One review request against pinned input: a base ref, or a prior job's patch. */
+/**
+ * One review request against pinned input: a base ref, or a prior job's patch.
+ *
+ * This vocabulary is deliberately VCS-shaped, and that is why
+ * {@link DelegationService.review} is an OPTIONAL capability: a provider with
+ * no checkout to pin against simply does not implement it, and
+ * {@link DelegationCapabilities.canReview} says so.
+ */
 export interface ReviewSpec {
   /** Git base ref for reviewing the current change. Mutually exclusive with `jobId`. */
   base?: string
@@ -76,8 +108,8 @@ export interface ReviewSpec {
   effort?: string
   /** Non-unique human metadata carried on the job record. */
   label?: string
-  /** Confinement override; defaults to the provider's configured default. */
-  sandbox?: DelegationSandbox
+  /** Provider-interpreted options; see {@link DelegationExtensions}. */
+  extensions?: DelegationExtensions
 }
 
 /** A projection of one tracked delegation, safe to hand to a consumer. */
@@ -87,8 +119,10 @@ export interface DelegationJob {
   /** Provider-reported status verbatim, when it did not map onto {@link DelegationStatus}. */
   rawStatus?: string
   label?: string
-  profile: string
-  mode: DelegationMode
+  /** Delegate identity, when the provider has more than one to distinguish. */
+  profile?: string
+  /** Granted workspace authority, when the provider models one. */
+  mode?: DelegationMode
   /** `delegate` or `review`. */
   kind?: string
   submittedAt?: string
@@ -179,6 +213,14 @@ export interface DelegationCapabilities {
   canSteer: boolean
   /** Whether {@link DelegationService.events} can do anything. */
   canReport: boolean
+  /** Whether {@link DelegationService.review} is implemented at all. */
+  canReview: boolean
+  /**
+   * Provider-interpreted {@link DelegateSpec.extensions} keys, each with a
+   * one-line description a consumer can show. Empty when the provider accepts
+   * none.
+   */
+  extensions: Record<string, { description: string }>
   /** Bounded, actionable diagnosis; present whenever `ready` is false. */
   diagnosis?: string
   /**
@@ -253,6 +295,8 @@ export type DelegationErrorCode =
   | 'delegate-failed'
   /** This delegate cannot serve a native review. */
   | 'review-unsupported'
+  /** No delegation with that id — usually a supervisor citing an id that never existed. */
+  | 'unknown-job'
   /** The provider does not implement this seam capability yet. */
   | 'unsupported'
   /** The provider reported an internal error. */
@@ -342,11 +386,16 @@ export abstract class DelegationService extends Service {
 
   /**
    * Queue one pinned read-only review turn and return immediately.
+   *
+   * OPTIONAL. Reviewing means pinning a VCS change, which a provider without a
+   * checkout cannot do; such a provider omits the method entirely and reports
+   * {@link DelegationCapabilities.canReview} as false. A consumer checks for
+   * the method (or the capability) and reports the absence as a domain outcome.
    * @param spec - review target and delegate identity.
    * @param options - per-call host session, workspace, and cancellation.
    * @returns the queued job projection.
    */
-  abstract review(spec: ReviewSpec, options?: DelegationCallOptions): Promise<DelegationJob>
+  review?(spec: ReviewSpec, options?: DelegationCallOptions): Promise<DelegationJob>
 
   /**
    * List tracked jobs, or project exactly one.
