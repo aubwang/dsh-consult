@@ -570,10 +570,10 @@ describe('earlier-session announcement', () => {
     (result.additionalContexts ?? []).map((message) =>
       message.content.map((block) => ('text' in block ? block.text : '')).join('\n'))
 
-  it('tells the model once, on the first delegation-family call', async () => {
+  it('tells a supervisor once, on its first delegation-family call', async () => {
     const harness = await setup({ scenario: { FAKE_CONSULT_ACTIVE_JOBS: '2', FAKE_CONSULT_FINAL_JOBS: '1' } })
-    const first = await harness.call('delegate_status', {})
-    const notice = contextsOf(first)
+    const owner = harness.owner('session-orphans')
+    const notice = contextsOf(await harness.call('delegate_status', {}, owner.agent))
     assert.equal(notice.length, 1, `expected one deferred notice, got ${JSON.stringify(notice)}`)
     assert.match(notice[0] as string, /2 delegations from earlier sessions are still active/)
     assert.match(notice[0] as string, /no completion notice will arrive for them/)
@@ -581,40 +581,65 @@ describe('earlier-session announcement', () => {
     assert.match(notice[0] as string, /wall-clock-capped/)
   })
 
-  it('never repeats it, whichever tool is called next', async () => {
+  it('never repeats it for that supervisor, whichever tool is called next', async () => {
     const harness = await setup({ scenario: { FAKE_CONSULT_ACTIVE_JOBS: '2' } })
-    assert.equal(contextsOf(await harness.call('delegate_status', {})).length, 1)
-    assert.equal(contextsOf(await harness.call('delegate_status', {})).length, 0)
-    assert.equal(contextsOf(await harness.call('delegate_logs', { job_id: 'job-1' })).length, 0)
-    assert.equal(contextsOf(await harness.call('delegate', { prompt: 'p' })).length, 0)
+    const owner = harness.owner('session-orphans-once')
+    assert.equal(contextsOf(await harness.call('delegate_status', {}, owner.agent)).length, 1)
+    assert.equal(contextsOf(await harness.call('delegate_status', {}, owner.agent)).length, 0)
+    assert.equal(contextsOf(await harness.call('delegate_logs', { job_id: 'job-1' }, owner.agent)).length, 0)
+    assert.equal(contextsOf(await harness.call('delegate', { prompt: 'p' }, owner.agent)).length, 0)
+  })
+
+  it('tells every supervisor in the context, not just the first one to ask', async () => {
+    // One plugin context can serve many agents. A process-wide "already said it"
+    // would let whichever agent moved first silence every other session.
+    const harness = await setup({ scenario: { FAKE_CONSULT_ACTIVE_JOBS: '2' } })
+    const first = harness.owner('session-orphans-a')
+    const second = harness.owner('session-orphans-b')
+    assert.equal(contextsOf(await harness.call('delegate_status', {}, first.agent)).length, 1)
+    assert.equal(contextsOf(await harness.call('delegate_status', {}, second.agent)).length, 1)
+    assert.equal(contextsOf(await harness.call('delegate_status', {}, first.agent)).length, 0)
+    assert.equal(contextsOf(await harness.call('delegate_status', {}, second.agent)).length, 0)
+  })
+
+  it('neither notifies nor silences anyone on an agent-less execution', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_ACTIVE_JOBS: '2' } })
+    assert.deepEqual(contextsOf(await harness.call('delegate_status', {})), [], 'nobody to tell')
+    const owner = harness.owner('session-orphans-after-anon')
+    assert.equal(contextsOf(await harness.call('delegate_status', {}, owner.agent)).length, 1,
+      'the anonymous call must not have consumed this supervisor\'s notice')
   })
 
   it('says nothing at all when nothing was left running', async () => {
     const harness = await setup({ scenario: { FAKE_CONSULT_FINAL_JOBS: '2' } })
-    assert.deepEqual(contextsOf(await harness.call('delegate_status', {})), [])
+    const owner = harness.owner('session-no-orphans')
+    assert.deepEqual(contextsOf(await harness.call('delegate_status', {}, owner.agent)), [])
   })
 
   it('uses the singular for one delegation', async () => {
     const harness = await setup({ scenario: { FAKE_CONSULT_ACTIVE_JOBS: '1' } })
-    const notice = contextsOf(await harness.call('delegate_status', {}))
+    const owner = harness.owner('session-one-orphan')
+    const notice = contextsOf(await harness.call('delegate_status', {}, owner.agent))
     assert.match(notice[0] as string, /1 delegation from earlier sessions is still active/)
   })
 
   it('bounds the notice summary', async () => {
     const harness = await setup({ scenario: { FAKE_CONSULT_ACTIVE_JOBS: '3' } })
-    const result = await harness.call('delegate_status', {})
+    const owner = harness.owner('session-orphan-bounds')
+    const result = await harness.call('delegate_status', {}, owner.agent)
     const summary = ((result.additionalContexts ?? [])[0]?.source as { summary?: string } | undefined)?.summary ?? ''
     assert.ok(summary.length > 0 && summary.length <= 120, `summary was ${summary.length} chars`)
   })
 
-  it('waits for a healthy preflight instead of announcing zero', async () => {
+  it('waits for a healthy preflight instead of announcing zero, per supervisor', async () => {
     const harness = await setup({
       scenario: { FAKE_CONSULT_ACTIVE_JOBS: '2', FAKE_CONSULT_DOCTOR_FAIL_FIRST: '1' },
       provider: { preflightRetryMs: 0 },
     })
+    const owner = harness.owner('session-orphans-late')
     // The first call cannot know anything: preflight is failing.
-    assert.deepEqual(contextsOf(await harness.call('delegate_status', {})), [])
-    const second = contextsOf(await harness.call('delegate_status', {}))
+    assert.deepEqual(contextsOf(await harness.call('delegate_status', {}, owner.agent)), [])
+    const second = contextsOf(await harness.call('delegate_status', {}, owner.agent))
     assert.equal(second.length, 1, 'the announcement waits for the provider to come up')
   })
 })
