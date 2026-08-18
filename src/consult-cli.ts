@@ -17,8 +17,10 @@ import {
   DelegationError,
   type DelegateSpec,
   type DelegationArtifacts,
+  type DelegationEvent,
   type DelegationJob,
   type DelegationJobId,
+  type DelegationLifecycle,
   type DelegationLineage,
   type DelegationMode,
   type DelegationResult,
@@ -418,6 +420,155 @@ export function mapExit(run: ConsultRun, context: ExitMappingContext): Error | u
     default:
       return new DelegationError('internal', `${where} failed with exit ${run.exitCode}`, options)
   }
+}
+
+/**
+ * `consult events` carries its own small versioned envelope — it is not a Job
+ * Result, so it does not reuse the schema-version-1 job sections even though
+ * both happen to be at version 1.
+ */
+export const SUPPORTED_EVENTS_SCHEMA_VERSION = 1
+
+/** Report types the delegate itself may emit. Anything else is ignored. */
+const REPORT_TYPES = ['blocked', 'decision_needed', 'discovery', 'progress'] as const
+
+/** Report types urgent enough to be worth opening a supervisor turn for. */
+const WAKE_TYPES: readonly string[] = ['blocked', 'decision_needed']
+
+/** Lifecycle phases the event stream synthesizes from the job record. */
+const LIFECYCLE_PHASES = ['queued', 'running', 'terminal'] as const
+
+/** Build `consult events` arguments. Always `--json`; `--follow` streams NDJSON. */
+export function eventsArgs(id: DelegationJobId, options: { follow?: boolean; sinceSeq?: number } = {}): string[] {
+  const args = ['events', id, '--json']
+  if (options.follow === true) args.push('--follow')
+  // `--since` filters the report stream only; lifecycle transitions are always
+  // replayed, which is exactly what a reconnecting follower needs.
+  if (options.sinceSeq !== undefined && options.sinceSeq > 0) args.push('--since', String(options.sinceSeq))
+  return args
+}
+
+/**
+ * Parse the non-follow events envelope
+ * (`{schemaVersion, jobId, events: [...]}`), bounding every delegate-authored
+ * field on the way out.
+ * @param stdout - the CLI's `--json` output.
+ * @param maxTextBytes - byte cap for each event message.
+ * @returns the projected events in emission order.
+ * @throws DelegationError `internal` when the output is not a version-1 events envelope.
+ */
+export function parseEventsEnvelope(stdout: string, maxTextBytes: number): DelegationEvent[] {
+  const parsed = parseJson(stdout)
+  if (!isRecord(parsed)) throw internalError('consult events --json output was not a JSON object')
+  if (parsed.schemaVersion !== SUPPORTED_EVENTS_SCHEMA_VERSION) {
+    throw internalError(`unsupported consult events schemaVersion ${JSON.stringify(parsed.schemaVersion)}; this plugin reads version ${SUPPORTED_EVENTS_SCHEMA_VERSION}`)
+  }
+  const jobId = stringOf(parsed.jobId)
+  if (jobId === undefined) throw internalError('consult events envelope carried no job id')
+  if (!Array.isArray(parsed.events)) throw internalError('consult events envelope carried no events array')
+  const events: DelegationEvent[] = []
+  for (const entry of parsed.events) {
+    const event = projectEvent(entry, jobId, maxTextBytes)
+    if (event !== undefined) events.push(event)
+  }
+  return events
+}
+
+/**
+ * Parse one NDJSON line from `consult events --follow --json`.
+ *
+ * A follow stream is read while it is being written, so a malformed or partial
+ * line is an ordinary occurrence rather than a contract violation: it is
+ * dropped, and the caller keeps reading. Only the framing version is enforced.
+ * @param line - one complete line from the follow stream.
+ * @param maxTextBytes - byte cap for the event message.
+ * @returns the projected event, or undefined when the line carries none.
+ */
+export function parseEventLine(line: string, maxTextBytes: number): DelegationEvent | undefined {
+  const trimmed = line.trim()
+  if (trimmed.length === 0) return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    return undefined
+  }
+  if (!isRecord(parsed) || parsed.schemaVersion !== SUPPORTED_EVENTS_SCHEMA_VERSION) return undefined
+  const jobId = stringOf(parsed.jobId)
+  if (jobId === undefined) return undefined
+  return projectEvent(parsed.event, jobId, maxTextBytes)
+}
+
+/**
+ * Project one raw consult event onto the seam vocabulary.
+ *
+ * Urgency is decided here, by type, because it is a property of what the
+ * delegate said rather than of who is listening: `blocked` and
+ * `decision_needed` mean the delegation cannot progress without the
+ * supervisor, so they are worth a turn; `discovery` and `progress` are worth
+ * reading on the next step. Lifecycle transitions are informational — the
+ * jobs runtime already announces completion.
+ * @param raw - one entry from an events envelope or follow line.
+ * @param jobId - the delegation the event belongs to.
+ * @param maxTextBytes - byte cap for the event message.
+ * @returns the projected event, or undefined for an unrecognized shape.
+ */
+export function projectEvent(raw: unknown, jobId: DelegationJobId, maxTextBytes: number): DelegationEvent | undefined {
+  if (!isRecord(raw)) return undefined
+  const at = stringOf(raw.at) ?? ''
+  const type = stringOf(raw.type)
+  if (type === undefined) return undefined
+  if (raw.kind === 'lifecycle') {
+    if (!(LIFECYCLE_PHASES as readonly string[]).includes(type)) return undefined
+    const phase = type as DelegationLifecycle['phase']
+    const status = phase === 'terminal' ? projectStatus(stringOf(raw.status)) : undefined
+    const errorMessage = stringOf(raw.errorMessage)
+    return {
+      jobId,
+      at,
+      type: 'lifecycle',
+      urgency: 'info',
+      message: phase === 'terminal' ? `delegation ${jobId} ${status ?? 'ended'}` : `delegation ${jobId} ${phase}`,
+      lifecycle: {
+        phase,
+        ...status !== undefined ? { status } : {},
+        ...errorMessage !== undefined ? { errorMessage: boundText(errorMessage, maxTextBytes, 'head').text } : {},
+      },
+    }
+  }
+  if (raw.kind !== 'report') return undefined
+  if (!(REPORT_TYPES as readonly string[]).includes(type)) return undefined
+  const seq = typeof raw.seq === 'number' && Number.isSafeInteger(raw.seq) ? raw.seq : undefined
+  const message = typeof raw.message === 'string' ? raw.message : ''
+  return {
+    jobId,
+    ...seq !== undefined ? { seq } : {},
+    at,
+    type: type as 'blocked' | 'decision_needed' | 'discovery' | 'progress',
+    urgency: WAKE_TYPES.includes(type) ? 'wake' : 'info',
+    message: boundText(message, maxTextBytes, 'head').text,
+    ...raw.data !== undefined ? { data: boundJson(raw.data, maxTextBytes) } : {},
+  }
+}
+
+/**
+ * Bound a structured event payload by re-encoding it and, when it does not
+ * fit, replacing it with the bounded text of its own encoding — a supervisor
+ * that cannot have the whole object is better served by a readable prefix than
+ * by a silently pruned object it might reason about as complete.
+ * @param data - the delegate-authored payload.
+ * @param maxBytes - byte budget for its JSON encoding.
+ * @returns the payload, or a bounded string standing in for it.
+ */
+export function boundJson(data: unknown, maxBytes: number): unknown {
+  let encoded: string
+  try {
+    encoded = JSON.stringify(data) ?? 'null'
+  } catch {
+    return '[unencodable delegate data]'
+  }
+  if (Buffer.byteLength(encoded, 'utf8') <= maxBytes) return data
+  return boundText(encoded, maxBytes, 'head').text
 }
 
 /** Result of bounding one text field. */

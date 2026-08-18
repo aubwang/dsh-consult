@@ -11,7 +11,7 @@
  * @module @aubwang/dsh-consult/render
  */
 
-import type { DelegationJob, DelegationResult } from './seam.ts'
+import type { DelegationEvent, DelegationJob, DelegationResult } from './seam.ts'
 
 /** Opening line of the untrusted-data frame; also used by the closing tag. */
 const FRAME_TAG = 'untrusted-delegate-output'
@@ -86,4 +86,72 @@ export function renderResult(result: DelegationResult): string {
  */
 export function renderFailure(code: string, message: string, detail?: string): string {
   return detail === undefined ? `[${code}] ${message}` : `[${code}] ${message}\n${detail}`
+}
+
+/** What one delegation event says to the supervisor, headline and body. */
+export interface DelegationEventNotice {
+  /** One line, for the message source's bounded summary. */
+  summary: string
+  /** The full notice, with the delegate's own words framed as untrusted data. */
+  body: string
+}
+
+/** Why each report type reached the supervisor, and what it is being asked for. */
+const EVENT_INTENT: Record<string, string> = {
+  blocked: 'It cannot make progress without you.',
+  decision_needed: 'It is waiting on a decision only you can make.',
+  discovery: 'It found something you may want to know before it finishes.',
+  progress: 'This is a progress note; no response is required.',
+}
+
+/**
+ * Render one delegate-authored event as a supervisor notice.
+ *
+ * The delegate cannot be steered in place today, so a notice states the two
+ * things a supervisor can actually do with it — act on the information, or
+ * cancel and re-delegate — rather than implying a reply channel that does not
+ * exist.
+ * @param event - the bounded, projected event.
+ * @param maxBodyBytes - byte budget for the complete notice body.
+ * @returns the bounded summary and body.
+ */
+export function renderDelegationEvent(event: DelegationEvent, maxBodyBytes: number): DelegationEventNotice {
+  const headline = `Delegate job ${event.jobId} reported: ${event.type}`
+  const firstLine = event.message.split('\n')[0] ?? ''
+  const sections = [
+    `${headline}. ${EVENT_INTENT[event.type] ?? ''}`.trim(),
+    frameDelegateText(event.jobId, `${event.type} report`, eventPayload(event)),
+  ]
+  if (event.urgency === 'wake') {
+    sections.push(`This delegation cannot be redirected in place: act on the report, or stop it with job_kill and `
+      + `delegate again with the corrected prompt. Read its transcript with delegate_logs ${event.jobId}.`)
+  }
+  const body = sections.join('\n\n')
+  const bounded = Buffer.byteLength(body, 'utf8') <= maxBodyBytes ? body : boundNoticeBody(body, maxBodyBytes)
+  return { summary: `${headline}: ${firstLine}`, body: bounded }
+}
+
+/** The delegate's own words plus any structured payload, both already bounded by the provider. */
+function eventPayload(event: DelegationEvent): string {
+  if (event.data === undefined) return event.message
+  const encoded = typeof event.data === 'string' ? event.data : safeJson(event.data)
+  return `${event.message}\n\ndata:\n${encoded}`
+}
+
+function safeJson(data: unknown): string {
+  try {
+    return JSON.stringify(data, null, 1) ?? 'null'
+  } catch {
+    return '[unencodable delegate data]'
+  }
+}
+
+/** Keep the notice head, which carries the headline and the frame opening. */
+function boundNoticeBody(body: string, maxBytes: number): string {
+  const marker = '\n[notice truncated]'
+  const budget = Math.max(0, maxBytes - Buffer.byteLength(marker, 'utf8'))
+  const kept = new TextDecoder('utf8', { fatal: false })
+    .decode(Buffer.from(body, 'utf8').subarray(0, budget))
+    .replace(/\uFFFD+$/, '')
+  return `${kept}${marker}`
 }

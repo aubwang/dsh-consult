@@ -122,24 +122,42 @@ export interface DelegationResult extends DelegationJob {
   lineage?: DelegationLineage
 }
 
+/** Which transition a `lifecycle` event reports. */
+export interface DelegationLifecycle {
+  phase: 'queued' | 'running' | 'terminal'
+  /** Terminal status, when the phase is `terminal`. */
+  status?: DelegationStatus
+  /** Bounded terminal failure text, when one exists. UNTRUSTED DATA. */
+  errorMessage?: string
+}
+
 /**
- * An upward child-to-supervisor message. The provider emits these once the
- * substrate supports them; until then {@link DelegationCapabilities.canReport}
- * is false and {@link DelegationService.events} returns an empty page.
+ * An upward child-to-supervisor message: either something the delegate
+ * deliberately reported mid-turn, or one of its own lifecycle transitions.
+ * A provider whose substrate cannot deliver events reports
+ * {@link DelegationCapabilities.canReport} as false and every
+ * {@link DelegationService.events} page as unsupported.
  */
 export interface DelegationEvent {
   jobId: DelegationJobId
-  /** Monotonic per-job sequence number. */
-  seq: number
+  /**
+   * Monotonic per-job sequence number, present on delegate-authored reports
+   * only. Lifecycle transitions carry none: they are derived from the job
+   * record rather than appended to the report stream, and a reader that
+   * resumes from a sequence still needs to learn the job ended.
+   */
+  seq?: number
   /** ISO-8601 emission time. */
   at: string
   type: 'blocked' | 'decision_needed' | 'discovery' | 'progress' | 'lifecycle'
   /** `wake` maps to a followup turn; `info` joins the owner's next step. */
   urgency: 'wake' | 'info'
-  /** Bounded message text. UNTRUSTED DATA. */
+  /** Bounded message text. UNTRUSTED DATA for every non-lifecycle type. */
   message: string
   /** Bounded structured payload. UNTRUSTED DATA. */
   data?: unknown
+  /** Present iff `type` is `lifecycle`. */
+  lifecycle?: DelegationLifecycle
 }
 
 /** What the mounted provider can actually do right now. */
@@ -368,9 +386,35 @@ export abstract class DelegationService extends Service {
   abstract events(id: DelegationJobId, fromSeq?: number, options?: DelegationCallOptions): Promise<DelegationEventPage>
 
   /**
-   * Subscribe to pushed delegation events.
+   * Follow one delegation's event stream and push each event to the listener.
+   *
+   * This is the call that makes a delegation observable while it runs: a
+   * provider starts whatever follow machinery it needs on the first watcher
+   * and stops it when the last one leaves, when the job reaches a terminal
+   * transition, or when the provider is disposed. Watching costs nothing when
+   * {@link DelegationCapabilities.canReport} is false — the returned
+   * unsubscribe is a no-op and no machinery starts.
+   *
+   * The listener also receives lifecycle transitions, so a consumer can see a
+   * delegation start and end without a second subscription. It must not throw;
+   * a provider contains listener failures rather than tearing down the follow.
+   * @param id - the delegation to follow.
+   * @param listener - receives each validated, bounded event for this job.
+   * @param options - per-call host session, workspace, and (task-owned) cancellation.
+   * @returns an unsubscribe function; idempotent.
+   */
+  abstract watch(
+    id: DelegationJobId,
+    listener: (event: DelegationEvent) => void,
+    options?: DelegationCallOptions,
+  ): () => void
+
+  /**
+   * Subscribe to every event the provider is already following, across all
+   * watched delegations. This is the observation seam — a metrics or audit
+   * consumer — and never starts a follow of its own.
    * @param listener - receives each validated, bounded event.
-   * @returns an unsubscribe function; a provider without push returns a no-op.
+   * @returns an unsubscribe function; idempotent.
    */
   abstract onEvent(listener: (event: DelegationEvent) => void): () => void
 }
