@@ -41,7 +41,10 @@ export function frameDelegateText(jobId: string, kind: string, text: string): st
 export function jobLine(job: DelegationJob): string {
   const parts = [`${job.id} ${job.status}`]
   if (job.rawStatus !== undefined) parts.push(`(provider status: ${job.rawStatus})`)
-  parts.push(`profile=${job.profile}`, `mode=${job.mode}`)
+  // A provider with one delegate and no authority axis reports neither, so
+  // neither is printed rather than printed as "undefined".
+  if (job.profile !== undefined) parts.push(`profile=${job.profile}`)
+  if (job.mode !== undefined) parts.push(`mode=${job.mode}`)
   if (job.label !== undefined) parts.push(`label=${JSON.stringify(job.label)}`)
   if (job.finishedAt !== undefined) parts.push(`finished=${job.finishedAt}`)
   return parts.join(' ')

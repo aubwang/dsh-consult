@@ -37,7 +37,6 @@ import {
   type DelegationJobId,
   type DelegationResult,
   type DelegationStatus,
-  type ReviewSpec,
   type SteerOutcome,
 } from './seam.ts'
 
@@ -75,7 +74,6 @@ interface ToyRecord {
   id: DelegationJobId
   status: DelegationStatus
   label?: string
-  mode: DelegationJob['mode']
   submittedAt: string
   finishedAt?: string
   finalText?: string
@@ -129,6 +127,10 @@ export class ToyDelegation extends DelegationService {
       defaultProfile: TOY_PROFILE,
       canSteer: false,
       canReport: false,
+      // No VCS, no checkout, nothing to pin a change against: `review` is not
+      // implemented at all rather than implemented as an apology.
+      canReview: false,
+      extensions: {},
     })
   }
 
@@ -136,14 +138,21 @@ export class ToyDelegation extends DelegationService {
     if (spec.prompt.trim().length === 0) {
       throw new DelegationError('unsupported', 'a delegation prompt must be non-empty')
     }
-    if (spec.isolated === true) {
-      // The seam models isolation as a detached worktree. This provider has no
-      // checkout to detach, so the honest answer is that it cannot serve the
-      // request rather than pretending the flag was applied.
-      throw new DelegationError('unsupported', 'the toy provider cannot isolate a delegation: it has no workspace to detach')
+    if (spec.mode === 'write') {
+      // `mode` is standard because every delegation answers "may this mutate
+      // anything". This one has no write path, so it says so instead of
+      // quietly downgrading the grant.
+      throw new DelegationError('unsupported', 'the toy provider has no write path: it cannot run a delegation in write mode')
     }
     if (spec.after !== undefined && spec.after.length > 0) {
       throw new DelegationError('unsupported', 'the toy provider does not chain delegations')
+    }
+    // Rejecting an unknown extension rather than ignoring it is the recommended
+    // provider behavior: a silently dropped key turns a supervisor's typo into
+    // an option it believes it set.
+    const unknown = Object.keys(spec.extensions ?? {})
+    if (unknown.length > 0) {
+      throw new DelegationError('unsupported', `the toy provider accepts no delegation extensions, got ${unknown.map((key) => JSON.stringify(key)).join(', ')}`)
     }
     this.sequence += 1
     const id = `toy-${this.sequence}` as DelegationJobId
@@ -151,7 +160,6 @@ export class ToyDelegation extends DelegationService {
       id,
       status: 'queued',
       ...spec.label !== undefined ? { label: spec.label } : {},
-      mode: spec.mode ?? 'read-only',
       submittedAt: new Date().toISOString(),
       finalTextTruncated: false,
       transcript: [`[${new Date().toISOString()}] queued`],
@@ -231,20 +239,18 @@ export class ToyDelegation extends DelegationService {
 
   private require(id: DelegationJobId): ToyRecord {
     const record = this.records.get(id)
-    // The seam has no domain code for "no such delegation", so this follows the
-    // same convention as the consult provider: an id the provider never issued
-    // is a caller bug, not an outcome to reason about.
-    if (record === undefined) throw new Error(`unknown delegation ${id}`)
+    if (record === undefined) throw new DelegationError('unknown-job', `no delegation ${id}`, { jobId: id })
     return record
   }
 
   private project(record: ToyRecord): DelegationJob {
+    // Neither `profile` nor `mode` is reported: this provider has one delegate
+    // and no authority axis, and inventing values to satisfy a type is exactly
+    // what made both fields optional in seam v2.
     return {
       id: record.id,
       status: record.status,
       ...record.label !== undefined ? { label: record.label } : {},
-      profile: TOY_PROFILE,
-      mode: record.mode,
       kind: 'delegate',
       submittedAt: record.submittedAt,
       ...record.finishedAt !== undefined ? { finishedAt: record.finishedAt } : {},
@@ -259,16 +265,6 @@ export class ToyDelegation extends DelegationService {
         : {},
       ...record.errorMessage !== undefined ? { errorMessage: record.errorMessage } : {},
     }
-  }
-
-  override review(_spec: ReviewSpec, _options?: DelegationCallOptions): Promise<DelegationJob> {
-    // ReviewSpec pins its input as a git base ref or a prior job's patch, and
-    // this provider has neither. Refusing is more honest than delegating a
-    // prompt that says "review" and calling the result a review.
-    return Promise.reject(new DelegationError(
-      'review-unsupported',
-      'the toy provider serves no reviews: it has no git workspace to pin a change against',
-    ))
   }
 
   override status(id?: DelegationJobId, _options?: DelegationCallOptions): Promise<DelegationJob[]> {
