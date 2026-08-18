@@ -402,13 +402,30 @@ PASS — 5 steps proven in 3s
 
 **What it proves that unit tests cannot.** That the supervisor is woken by a delegate that is genuinely stuck rather than by a canned event; that a steer survives the cancel-and-re-prompt round trip with the delegation keeping its id and finishing `completed` rather than `cancelled`; and that the guidance text reaches the model, because the delegate echoes it back and the drill asserts the token in `finalText`.
 
+### Live dogfood
+
+The same five steps run against a **real** agent instead of the scripted one:
+
+```sh
+DRILL_PROFILE=codex node drill/full-loop.mjs
+```
+
+Live mode copies that profile's record out of the user's own `~/.consult/profiles.json` into the throwaway registry, so authentication and configuration are exercised exactly as configured — the drill never writes to the real registry. The delegation stays read-only and the prompt stays tiny, because this spends the agent's tokens: it asks for one naming decision and *teaches the loop*, since a real agent has no reason to guess that reporting upward is available. Effort is pinned low and nothing retries.
+
+Two things differ from fake mode. Timeouts are generous (`DRILL_REPORT_WAIT_MS`, `DRILL_FINISH_WAIT_MS`), because a real turn is a network round trip. And step b races the blocked report against the delegation *finishing without one*, so "the agent ignored the instruction" fails with a different message than "the plumbing broke" — the first is a prompt problem, and the drill says so rather than letting it look like a defect.
+
+**What the first live run found.** It does not pass yet, and the reason is upstream. codex tried to run `consult report` and was refused: *"Unable to request guidance: the required command needed write approval, which was denied."* A real ACP agent routes command execution through the client's permission system, and consult's permission layer denies **every** `execute` request today — read-only mode denies it, write mode denies it without an opt-in, and the opt-in path denies it too (`--allow-exec` also fails preflight). So a real delegate cannot invoke `consult report` at all yet.
+
+The fake delegate gets away with it only because it spawns the subprocess itself and never asks the client for permission. **That means fake mode does not prove a real delegate can report** — it proves the plugin's side of the loop (report line → event stream → wake → steer → completion) works, which is what it was built for. Closing the gap needs consult's execute-permission work, not a change here; the drill names that cause specifically when the agent's answer mentions a denial, rather than blaming the prompt.
+
 **Requirements.** A consult with `report`, `events`, and `steer`. Everything lives in a throwaway `CONSULT_DATA_DIR` and git workspace, both removed on success; no consult state on the machine is read or written. It must run where **unix sockets can be created under the temp directory** — a background delegation is served by a broker listening on one, and the worker is spawned `stdio: 'ignore'`, so a sandbox that denies `listen(2)` leaves every job silently at `queued`. That is the first thing to check if the drill hangs at step b.
 
 ## Known Limitations and Deferred Work
 
 - **Steering needs a consult that has it.** Against a consult without `steer`, `capabilities().canSteer` is false and `delegate_steer` returns an `unsupported` outcome. The tool is still registered, so the model gets a real answer rather than a missing capability.
 - **Upward reports need a consult that has them.** Against a consult without `report`/`events`, `capabilities().canReport` is false, `events()` returns a typed unsupported page, and nothing follows anything — the supervisor learns the outcome at completion, exactly as before. There is no fallback that synthesizes reports from the transcript.
-- **A delegate only reports if it is asked to.** `consult report` is a command the delegated agent must choose to run, so a prompt that never mentions it produces lifecycle events and nothing else. Confined delegations cannot execute anything at all, so mid-flight reporting is an inherit-sandbox capability today.
+- **A real ACP delegate cannot run `consult report` yet.** Upward reporting depends on the delegate executing the consult CLI mid-turn, and consult's permission layer denies every `execute` request today — in read-only mode, in write mode without an opt-in, and in the opt-in path too. A real agent asks its client for permission and is refused; only a delegate that spawns subprocesses without asking (like this package's drill fixture) can report. Everything downstream of the report line — the event stream, the wake, the steer, the completion — is verified end to end against real consult, so this is a single upstream gate rather than an unfinished feature here. `drill/full-loop.mjs` with `DRILL_PROFILE=<name>` is the check that will go green when it lifts.
+- **A delegate only reports if it is asked to.** Even once execution is permitted, `consult report` is a command the agent must choose to run, so a prompt that never mentions it produces lifecycle events and nothing else.
 - **Only background, non-isolated delegations can be steered.** A foreground delegate and an `--isolated` job both run their turn in-process with no broker socket to reach, so consult refuses them with `unsupported`. That is a consult boundary, not a plugin one. Everything this plugin starts is background, so the practical limit is `isolated: true`.
 - **Steering is an interruption, not a conversation.** The delegate's current turn is stopped and re-prompted; there is no reply channel and no acknowledgement beyond the exit code. A steer that consult accepted may still be ignored by the delegate.
 - **`status`, `result`, and `logs` still require full readiness**, unlike `events`, `watch`, and `steer`. The same argument for ungating applies to them, but changing their semantics was out of scope for the event and steer work; it is a deliberate, known asymmetry rather than an oversight.
