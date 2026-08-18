@@ -21,3 +21,16 @@
     # ctx.delegation; picks up ctx.jobs when one is mounted.
     - id: tool-delegate
       name: '@aubwang/dsh-consult/tools'
+
+# Swapping the provider is a one-row change, because the consumer talks only to
+# ctx.delegation. A profile's own patch layer can replace the row by id:
+#
+#   - insert:
+#       - id: consult-delegation
+#         name: '@aubwang/dsh-consult/toy-provider'
+#         config:
+#           delayMs: 50
+#
+# Only one provider may be mounted per context — ctx.delegation is a single
+# service name, and loading a second implementation throws. drill/toy.patch.yml
+# is a runnable version of the swap.
