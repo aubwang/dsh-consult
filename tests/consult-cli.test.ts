@@ -16,6 +16,8 @@ import {
   eventsArgs,
   gateConsultVersion,
   mapExit,
+  mapSteerExit,
+  MAX_STEER_GUIDANCE_BYTES,
   parseDoctorReport,
   parseEventLine,
   parseEventsEnvelope,
@@ -25,6 +27,7 @@ import {
   projectJob,
   projectResult,
   reviewArgs,
+  steerArgs,
   type ConsultRun,
 } from '../src/consult-cli.ts'
 import { DelegationError } from '../src/seam.ts'
@@ -431,5 +434,60 @@ describe('boundJson', () => {
     const cyclic: Record<string, unknown> = {}
     cyclic.self = cyclic
     assert.equal(boundJson(cyclic, 1000), '[unencodable delegate data]')
+  })
+})
+
+describe('steer argv and exit mapping', () => {
+  it('sends the guidance through --message so a leading dash cannot be re-read as a flag', () => {
+    assert.deepEqual(steerArgs('job-7', '--force the other approach'), ['steer', 'job-7', '--message', '--force the other approach'])
+  })
+
+  it('agrees with consult on the guidance bound', () => {
+    assert.equal(MAX_STEER_GUIDANCE_BYTES, 16 * 1024)
+  })
+
+  it('reads exit 0 as delivered', () => {
+    const outcome = mapSteerExit(run({ exitCode: 0, stdout: 'steered job-7\n' }), 'job-7')
+    assert.deepEqual(outcome, { supported: true, accepted: true, detail: 'steered job-7' })
+  })
+
+  it('reads exit 1 as a delegation that can never be steered', () => {
+    const outcome = mapSteerExit(run({ exitCode: 1, stderr: 'steer is not available for job job-7 (inline runner)' }), 'job-7')
+    assert.equal('supported' in outcome && outcome.supported, false)
+    assert.match((outcome as { reason: string }).reason, /inline runner/)
+  })
+
+  it('reads exit 3 as supported but not right now', () => {
+    const outcome = mapSteerExit(run({ exitCode: 3, stderr: 'STEER_PENDING: a previous steer is still being delivered' }), 'job-7')
+    assert.deepEqual(outcome, { supported: true, accepted: false, detail: 'STEER_PENDING: a previous steer is still being delivered' })
+  })
+
+  it('reads exit 5 as outside the running window, not as a hard refusal', () => {
+    const outcome = mapSteerExit(run({ exitCode: 5, stderr: 'job already finalized; cannot steer (status=completed)' }), 'job-7')
+    assert.equal('accepted' in outcome && outcome.accepted, false)
+    assert.equal('supported' in outcome && outcome.supported, true)
+  })
+
+  it('keeps exit 2 an infrastructure failure, like every other command', () => {
+    const outcome = mapSteerExit(run({ exitCode: 2, stderr: 'job not found' }), 'nope')
+    assert.ok(outcome instanceof Error)
+    assert.equal(outcome instanceof DelegationError, false)
+  })
+
+  it('falls back to a supplied reason when consult said nothing', () => {
+    const outcome = mapSteerExit(run({ exitCode: 1 }), 'job-7')
+    assert.match((outcome as { reason: string }).reason, /refused the guidance/)
+  })
+})
+
+describe('steer events', () => {
+  it('projects a steer echo as an informational event sharing the report sequence', () => {
+    const event = projectEvent({ kind: 'steer', type: 'steer', at: 'a', seq: 2, message: 'skip the migration' }, 'job-7', 1000)
+    assert.deepEqual(event, { jobId: 'job-7', seq: 2, at: 'a', type: 'steer', urgency: 'info', message: 'skip the migration' })
+  })
+
+  it('bounds the echoed guidance preview like any other delegate-visible text', () => {
+    const event = projectEvent({ kind: 'steer', type: 'steer', at: 'a', seq: 1, message: 'z'.repeat(5000) }, 'job-7', 100)
+    assert.ok(Buffer.byteLength(event?.message ?? '', 'utf8') < 200)
   })
 })

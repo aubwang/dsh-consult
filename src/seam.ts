@@ -149,7 +149,12 @@ export interface DelegationEvent {
   seq?: number
   /** ISO-8601 emission time. */
   at: string
-  type: 'blocked' | 'decision_needed' | 'discovery' | 'progress' | 'lifecycle'
+  /**
+   * `steer` is the supervisor's own guidance echoed back into the stream, so a
+   * consumer can see it while inspecting a delegation without being notified
+   * about something it just did.
+   */
+  type: 'blocked' | 'decision_needed' | 'discovery' | 'progress' | 'steer' | 'lifecycle'
   /** `wake` maps to a followup turn; `info` joins the owner's next step. */
   urgency: 'wake' | 'info'
   /** Bounded message text. UNTRUSTED DATA for every non-lifecycle type. */
@@ -368,9 +373,17 @@ export abstract class DelegationService extends Service {
   abstract cancel(id: DelegationJobId, options?: DelegationCallOptions): Promise<void>
 
   /**
-   * Redirect a live delegation without losing its session.
+   * Redirect a live delegation without losing its session: the running turn is
+   * stopped and the same session is immediately re-prompted with the guidance,
+   * so the delegation keeps its id, log, and budget.
+   *
+   * Three outcomes, all normal: accepted; supported but not accepted right now
+   * (a steer already in flight, a contended provider, a delegation outside its
+   * running window); or not supported at all for this delegation (a provider
+   * or a job shape that has no way to reach the live turn), which is the
+   * cancel-and-re-delegate signal.
    * @param id - the job to steer.
-   * @param guidance - bounded supervisor guidance.
+   * @param guidance - supervisor guidance, rejected rather than truncated when oversized.
    * @param options - per-call host session, workspace, and cancellation.
    * @returns the steer outcome; `supported: false` is a normal answer.
    */

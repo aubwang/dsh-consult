@@ -30,6 +30,9 @@ import {
   reviewArgs,
   runConsult,
   runConsultWithRetry,
+  steerArgs,
+  mapSteerExit,
+  MAX_STEER_GUIDANCE_BYTES,
   type ConsultInvocation,
   type ConsultSpawn,
 } from './consult-cli.ts'
@@ -120,11 +123,13 @@ interface PreflightState {
   defaultProfile?: string
   /** Whether the configured consult exposes the `events` command. */
   canReport: boolean
+  /** Whether the configured consult exposes the `steer` command. */
+  canSteer: boolean
   diagnosis?: string
 }
 
-const STEER_UNSUPPORTED = 'consult 1.x has no steer command. Cancel the job and re-delegate with the corrected prompt; '
-  + 'native steering arrives with dsh-consult M3.'
+const STEER_UNSUPPORTED = 'this consult build has no `steer` command, so a running delegation cannot be redirected in place. '
+  + 'Stop it and delegate again with the corrected prompt, or install a consult with `consult steer`.'
 const EVENTS_UNSUPPORTED = 'this consult build has no `events` command, so a delegate cannot report upward mid-turn. '
   + 'Read progress with delegate_logs instead, or install a consult with `consult report`/`consult events`.'
 
@@ -265,6 +270,7 @@ export class ConsultDelegation extends DelegationService {
         usable: false,
         profiles: [],
         canReport: false,
+        canSteer: false,
         diagnosis: `could not resolve the consult executable ${JSON.stringify(this.config.consultPath)}: `
           + `${error instanceof Error ? error.message : String(error)}. Install consult, or set the plugin's \`consultPath\`.`,
       }
@@ -279,6 +285,7 @@ export class ConsultDelegation extends DelegationService {
         usable: false,
         profiles: [],
         canReport: false,
+        canSteer: false,
         diagnosis: `could not run \`consult --version\`: ${error instanceof Error ? error.message : String(error)}`,
       }
     }
@@ -291,6 +298,7 @@ export class ConsultDelegation extends DelegationService {
         usable: false,
         profiles: [],
         canReport: false,
+        canSteer: false,
         diagnosis: `\`${this.config.consultPath} --version\` exited ${versionRun.exitCode ?? 'by signal'} (${output.slice(0, 200)}). `
           + 'consult only accepts `--version` from 1.0 onwards, so this is most likely a pre-1.0 install; '
           + 'this plugin supports >=1.0.0 <2.0.0. Upgrade consult, or point the plugin\'s `consultPath` at a 1.x install.',
@@ -298,16 +306,19 @@ export class ConsultDelegation extends DelegationService {
     }
     const gate = gateConsultVersion(versionRun.stdout)
     if (!gate.ok) {
-      return { ready: false, usable: false, profiles: [], canReport: false, ...gate.version !== undefined ? { version: gate.version } : {}, diagnosis: gate.reason }
+      return { ready: false, usable: false, profiles: [], canReport: false, canSteer: false, ...gate.version !== undefined ? { version: gate.version } : {}, diagnosis: gate.reason }
     }
 
     const doctorRun = await runConsult(this.spawn, ['doctor', '--json'], invocation).catch(() => undefined)
     if (doctorRun === undefined) {
-      return { ready: false, usable: true, version: gate.version, profiles: [], canReport: false, diagnosis: 'could not run `consult doctor --json`' }
+      return { ready: false, usable: true, version: gate.version, profiles: [], canReport: false, canSteer: false, diagnosis: 'could not run `consult doctor --json`' }
     }
     const doctor = parseDoctorReport(doctorRun.stdout, doctorRun.stderr)
     const roster = await this.probeProfiles(invocation)
-    const canReport = await this.probeEvents(invocation)
+    const [canReport, canSteer] = await Promise.all([
+      this.probeCommand(invocation, 'events'),
+      this.probeCommand(invocation, 'steer'),
+    ])
     if (!doctor.canDelegate) {
       return {
         ready: false,
@@ -315,6 +326,7 @@ export class ConsultDelegation extends DelegationService {
         version: gate.version,
         profiles: roster.profiles,
         canReport,
+        canSteer,
         ...roster.defaultProfile !== undefined ? { defaultProfile: roster.defaultProfile } : {},
         diagnosis: `consult cannot delegate right now — ${doctor.diagnosis ?? 'no diagnosis reported'}. `
           + 'Run `consult doctor` in the workspace, and `consult setup --install <profile>` if no profile is configured.',
@@ -327,24 +339,26 @@ export class ConsultDelegation extends DelegationService {
       version: gate.version,
       profiles: roster.profiles,
       canReport,
+      canSteer,
       ...defaultProfile !== undefined ? { defaultProfile } : {},
     }
   }
 
   /**
-   * Decide whether this consult can deliver upward events.
+   * Decide whether this consult exposes one optional command.
    *
-   * The probe is `consult events --help`: a command's own help exits 0 when the
-   * command exists and 2 when the subcommand is unknown, which is exactly the
-   * distinction being made. It touches no job, no workspace state, and no
-   * profile — unlike `doctor`, running it costs nothing but a process. Version
-   * numbers cannot answer this question: `report`/`events` landed after 1.0.0
-   * was cut, so two builds reporting 1.0.0 differ on it.
+   * The probe is the command's own `--help`: it exits 0 when the command exists
+   * and 2 when the subcommand is unknown, which is exactly the distinction
+   * being made. It touches no job, no workspace state, and no profile — unlike
+   * `doctor`, running it costs nothing but a process. Version numbers cannot
+   * answer this question: `report`/`events` and `steer` all landed after 1.0.0
+   * was cut, so two builds both reporting 1.0.0 differ on them.
    * @param invocation - the resolved executable, directory, environment, and budgets.
-   * @returns whether the events command exists.
+   * @param command - the consult subcommand to probe for.
+   * @returns whether the command exists.
    */
-  private async probeEvents(invocation: ConsultInvocation): Promise<boolean> {
-    const run = await runConsult(this.spawn, ['events', '--help'], invocation).catch(() => undefined)
+  private async probeCommand(invocation: ConsultInvocation, command: string): Promise<boolean> {
+    const run = await runConsult(this.spawn, [command, '--help'], invocation).catch(() => undefined)
     return run?.exitCode === 0
   }
 
@@ -389,7 +403,7 @@ export class ConsultDelegation extends DelegationService {
       ...state.version !== undefined ? { version: state.version } : {},
       profiles: state.profiles,
       ...state.defaultProfile !== undefined ? { defaultProfile: state.defaultProfile } : {},
-      canSteer: false,
+      canSteer: state.canSteer,
       canReport: state.canReport,
       ...state.diagnosis !== undefined ? { diagnosis: state.diagnosis } : {},
     }
@@ -477,8 +491,32 @@ export class ConsultDelegation extends DelegationService {
     if (error !== undefined) throw error
   }
 
-  override steer(_id: DelegationJobId, _guidance: string, _options?: DelegationCallOptions): Promise<SteerOutcome> {
-    return Promise.resolve({ supported: false, reason: STEER_UNSUPPORTED })
+  override async steer(id: DelegationJobId, guidance: string, options?: DelegationCallOptions): Promise<SteerOutcome> {
+    // Rejected, never trimmed: a clipped instruction changes what the
+    // delegation is being told to do. Checked before spawning so an oversized
+    // guidance fails as the argument error it is.
+    const bytes = Buffer.byteLength(guidance, 'utf8')
+    if (bytes > MAX_STEER_GUIDANCE_BYTES) {
+      throw new Error(`guidance is ${bytes} bytes; the limit is ${MAX_STEER_GUIDANCE_BYTES}. Shorten it — consult rejects oversized guidance rather than trimming it.`)
+    }
+    if (guidance.trim().length === 0) throw new Error('guidance must be a non-empty string')
+    // Steering an existing delegation is observation-grade, like reading its
+    // events: it needs a usable binary with the command, not the ability to
+    // start new delegations.
+    const state = await this.preflight(options)
+    if (!state.usable) {
+      throw new DelegationError('not-ready', 'delegation is unavailable', {
+        ...state.diagnosis !== undefined ? { detail: state.diagnosis } : {},
+      })
+    }
+    if (!state.canSteer) return { supported: false, reason: STEER_UNSUPPORTED }
+    // Deliberately NOT runConsultWithRetry: exit 3 means a steer is already in
+    // flight, and delivering a second interruption of the same turn is worse
+    // than reporting that this one did not land.
+    const run = await runConsult(this.spawn, steerArgs(id, guidance), await this.invocation(options))
+    const outcome = mapSteerExit(run, id)
+    if (outcome instanceof Error) throw outcome
+    return outcome
   }
 
   override async events(

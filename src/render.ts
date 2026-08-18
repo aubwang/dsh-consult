@@ -98,6 +98,7 @@ export interface DelegationEventNotice {
 
 /** Why each report type reached the supervisor, and what it is being asked for. */
 const EVENT_INTENT: Record<string, string> = {
+  steer: 'This is your own guidance, echoed back.',
   blocked: 'It cannot make progress without you.',
   decision_needed: 'It is waiting on a decision only you can make.',
   discovery: 'It found something you may want to know before it finishes.',
@@ -154,4 +155,30 @@ function boundNoticeBody(body: string, maxBytes: number): string {
     .decode(Buffer.from(body, 'utf8').subarray(0, budget))
     .replace(/\uFFFD+$/, '')
   return `${kept}${marker}`
+}
+
+/**
+ * Render one steer outcome for the supervisor, naming what happened and what
+ * is still open to it. A refusal that will never clear and a refusal that
+ * might are different situations, so they get different advice.
+ * @param jobId - the delegation the guidance was aimed at.
+ * @param outcome - accepted, refused for now, or unsupported for this delegation.
+ * @param detail - bounded provider explanation, when one exists.
+ * @returns model-facing text.
+ */
+export function renderSteer(jobId: string, outcome: 'accepted' | 'refused' | 'unsupported', detail?: string): string {
+  const because = detail === undefined ? '' : `\n${detail}`
+  if (outcome === 'accepted') {
+    return `Guidance delivered to delegation ${jobId}. Its running turn was stopped and the same session was `
+      + `immediately re-prompted with your guidance, so the delegation keeps its id, its transcript, and its budget, `
+      + `and will finish normally. Do not re-send the same guidance.${because}`
+  }
+  if (outcome === 'refused') {
+    return `Delegation ${jobId} did not take the guidance right now.${because}\n`
+      + `Either an earlier steer is still being delivered, or the delegation is not in its running window `
+      + `(still queued, or already finished). Check delegate_status ${jobId}, then send it once more if it is still `
+      + `running — do not resend in a loop. If it already finished, read the answer with delegate_result ${jobId}.`
+  }
+  return `Delegation ${jobId} cannot be steered at all.${because}\n`
+    + `Stop it with job_kill and delegate again with the guidance written into the new prompt.`
 }

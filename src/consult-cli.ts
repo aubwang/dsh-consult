@@ -27,6 +27,7 @@ import {
   type DelegationSandbox,
   type DelegationStatus,
   type ReviewSpec,
+  type SteerOutcome,
 } from './seam.ts'
 
 /** The one process primitive this adapter needs; `ctx.subprocess.spawn` satisfies it. */
@@ -429,6 +430,14 @@ export function mapExit(run: ConsultRun, context: ExitMappingContext): Error | u
  */
 export const SUPPORTED_EVENTS_SCHEMA_VERSION = 1
 
+/**
+ * Guidance larger than this is rejected by consult rather than trimmed — a
+ * clipped instruction changes what the delegation is being told to do. The
+ * plugin enforces the same bound before spawning so an oversized guidance
+ * fails as an argument error instead of a process exit.
+ */
+export const MAX_STEER_GUIDANCE_BYTES = 16 * 1024
+
 /** Report types the delegate itself may emit. Anything else is ignored. */
 const REPORT_TYPES = ['blocked', 'decision_needed', 'discovery', 'progress'] as const
 
@@ -437,6 +446,15 @@ const WAKE_TYPES: readonly string[] = ['blocked', 'decision_needed']
 
 /** Lifecycle phases the event stream synthesizes from the job record. */
 const LIFECYCLE_PHASES = ['queued', 'running', 'terminal'] as const
+
+/**
+ * Build `consult steer` arguments. The guidance goes through `--message`
+ * rather than after `--`, so text that begins with a dash cannot be re-read as
+ * a flag by anything downstream.
+ */
+export function steerArgs(id: DelegationJobId, guidance: string): string[] {
+  return ['steer', id, '--message', guidance]
+}
 
 /** Build `consult events` arguments. Always `--json`; `--follow` streams NDJSON. */
 export function eventsArgs(id: DelegationJobId, options: { follow?: boolean; sinceSeq?: number } = {}): string[] {
@@ -536,6 +554,20 @@ export function projectEvent(raw: unknown, jobId: DelegationJobId, maxTextBytes:
       },
     }
   }
+  if (raw.kind === 'steer') {
+    // The supervisor's own guidance, echoed back with a bounded preview. It
+    // shares the report sequence space, so a resuming reader must not be able
+    // to skip a steer by having read past it.
+    const seq = typeof raw.seq === 'number' && Number.isSafeInteger(raw.seq) ? raw.seq : undefined
+    return {
+      jobId,
+      ...seq !== undefined ? { seq } : {},
+      at,
+      type: 'steer',
+      urgency: 'info',
+      message: boundText(typeof raw.message === 'string' ? raw.message : '', maxTextBytes, 'head').text,
+    }
+  }
   if (raw.kind !== 'report') return undefined
   if (!(REPORT_TYPES as readonly string[]).includes(type)) return undefined
   const seq = typeof raw.seq === 'number' && Number.isSafeInteger(raw.seq) ? raw.seq : undefined
@@ -569,6 +601,48 @@ export function boundJson(data: unknown, maxBytes: number): unknown {
   }
   if (Buffer.byteLength(encoded, 'utf8') <= maxBytes) return data
   return boundText(encoded, maxBytes, 'head').text
+}
+
+/**
+ * Map one `consult steer` exit onto the seam's steer vocabulary.
+ *
+ * The three families are deliberately distinct, because a supervisor does
+ * something different with each: `supported: false` means this delegation can
+ * never be steered, so cancel and re-delegate; `accepted: false` means not
+ * right now, so wait and try once more; `accepted: true` means the running
+ * turn was stopped and re-prompted on the same session.
+ *
+ * Exit 3 is NOT retried here, unlike every other consult call. A steer already
+ * in flight will not clear by immediately trying again, and a duplicate steer —
+ * two interruptions of the same turn — is worse than a missed one.
+ * @param run - the completed invocation.
+ * @param id - the delegation the steer was aimed at.
+ * @returns the steer outcome, or an Error to throw for an invocation this plugin got wrong.
+ */
+export function mapSteerExit(run: ConsultRun, id: DelegationJobId): SteerOutcome | Error {
+  const detail = firstLines(run.stderr.trim().length > 0 ? run.stderr : run.stdout, 10, 1000)
+  switch (run.exitCode) {
+    case CONSULT_EXIT.ok:
+      return { supported: true, accepted: true, ...detail.length > 0 ? { detail } : {} }
+    case CONSULT_EXIT.internal:
+      // consult's own refusal family: an inline or isolated job with no socket
+      // to reach, a profile that cannot be steered, or an unreachable broker.
+      return { supported: false, reason: detail.length > 0 ? detail : `consult steer ${id} refused the guidance` }
+    case CONSULT_EXIT.contention:
+      return {
+        supported: true,
+        accepted: false,
+        detail: detail.length > 0 ? detail : 'a steer is already being delivered, or the consult broker is busy',
+      }
+    case CONSULT_EXIT.notFinal:
+      return {
+        supported: true,
+        accepted: false,
+        detail: detail.length > 0 ? detail : `delegation ${id} is not running: it is still queued, or already finished`,
+      }
+    default:
+      return mapExit(run, { command: 'steer', jobId: id }) ?? new Error(`consult steer ${id} failed with exit ${String(run.exitCode)}`)
+  }
 }
 
 /** Result of bounding one text field. */
@@ -614,9 +688,9 @@ export function boundLines(text: string, maxLines: number, maxBytes: number): Bo
   return { text: bounded.text, truncated: bounded.truncated || droppedLines > 0 }
 }
 
-/** Take the first `maxLines` lines of text, capped at `maxBytes`. */
+/** Take the first `maxLines` lines of text, capped at `maxBytes`, without surrounding whitespace. */
 function firstLines(text: string, maxLines: number, maxBytes: number): string {
-  const lines = text.split('\n').slice(0, maxLines).join('\n')
+  const lines = text.trim().split('\n').slice(0, maxLines).join('\n')
   return boundText(lines, maxBytes, 'head').text
 }
 

@@ -23,7 +23,7 @@ import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent'
 import { advanceLogCursor } from './log-cursor.ts'
-import { frameDelegateText, jobLine, renderDelegationEvent, renderFailure, renderResult } from './render.ts'
+import { frameDelegateText, jobLine, renderDelegationEvent, renderFailure, renderResult, renderSteer } from './render.ts'
 import {
   isDelegationError,
   type DelegateSpec,
@@ -231,7 +231,11 @@ export function apply(ctx: Context, config: Config = {}): void {
    * one turn each.
    */
   const deliverEvent = (owner: Agent, event: DelegationEvent): void => {
-    if (event.type === 'lifecycle') return
+    // `lifecycle` is already announced by dsh-tool-jobs' completion notice, and
+    // `steer` is the supervisor's own guidance coming back — notifying it about
+    // something it just did is pure noise. Both still appear in events() for
+    // inspection.
+    if (event.type === 'lifecycle' || event.type === 'steer') return
     const notice = renderDelegationEvent(event, resolved.outputLimitBytes)
     try {
       const message = createUserMessage({
@@ -727,5 +731,73 @@ export function apply(ctx: Context, config: Config = {}): void {
       }
     },
     isConcurrencySafe: () => true,
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'delegate_steer',
+    description: 'Send corrective guidance into a delegation that is still running. Its current turn is stopped and the '
+      + 'same session is immediately re-prompted with your guidance, so the delegation keeps its id, its transcript, and '
+      + 'its budget — you do not start a new one. Use it when a report or the transcript shows the delegate going the '
+      + 'wrong way, or when it reported being blocked on something you can now answer. Write the guidance as a complete '
+      + 'instruction: the delegate sees it alongside its original task, not this conversation. Not every delegation can '
+      + 'be steered, and one that has already finished cannot — the result says which, and what to do instead.',
+    parameters: {
+      job_id: { type: 'string', required: true, description: 'The running delegation to steer.' },
+      guidance: {
+        type: 'string',
+        required: true,
+        description: 'The complete instruction to interject. Rejected, not trimmed, above 16 KiB.',
+      },
+    },
+    output: {
+      schema: {
+        oneOf: [
+          {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              kind: { type: 'string', required: true, const: 'steer' },
+              jobId: { type: 'string', required: true },
+              outcome: {
+                type: 'string',
+                required: true,
+                enum: ['accepted', 'refused', 'unsupported'],
+                description: 'accepted: the turn was re-prompted. refused: not right now — check status and try once more. '
+                  + 'unsupported: this delegation can never be steered; cancel and re-delegate.',
+              },
+              detail: { type: 'string' },
+            },
+          },
+          { type: 'object', additionalProperties: false, properties: FAILURE_PROPERTIES },
+        ],
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.kind === 'failure'
+          ? renderFailure(value.code, value.message, value.detail)
+          : renderSteer(value.jobId, value.outcome, value.detail),
+      }],
+    },
+    async execute(args, exec) {
+      if (args.guidance.trim().length === 0) {
+        throw new Error('invalid guidance: expected a non-empty instruction')
+      }
+      let outcome
+      try {
+        outcome = await ctx.delegation.steer(args.job_id, args.guidance, callOptions(exec))
+      } catch (error) {
+        return toFailure(error)
+      }
+      if (!outcome.supported) {
+        return { kind: 'steer' as const, jobId: args.job_id, outcome: 'unsupported' as const, detail: outcome.reason }
+      }
+      return {
+        kind: 'steer' as const,
+        jobId: args.job_id,
+        outcome: outcome.accepted ? 'accepted' as const : 'refused' as const,
+        ...outcome.detail !== undefined ? { detail: outcome.detail } : {},
+      }
+    },
+    presentCall: (args) => presentStart('delegate_steer', `${args.job_id}: ${noticeLine(args.guidance, 100)}`),
   }))
 }

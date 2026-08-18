@@ -84,7 +84,7 @@ describe('preflight', () => {
     assert.equal(capabilities.version, '1.0.0')
     assert.deepEqual([...capabilities.profiles], ['claude', 'codex'])
     assert.equal(capabilities.defaultProfile, 'claude')
-    assert.equal(capabilities.canSteer, false)
+    assert.equal(capabilities.canSteer, true, 'this consult build has the steer command')
     assert.equal(capabilities.canReport, true, 'this consult build has the events command')
   })
 
@@ -279,11 +279,8 @@ describe('status, cancel, and the deferred capabilities', () => {
     assert.deepEqual(of(harness, 'cancel')[0]?.argv, ['cancel', 'job-1'])
   })
 
-  it('answers steer with a typed unsupported outcome, never a crash', async () => {
+  it('exposes the global event bus', async () => {
     const harness = await setup()
-    const steer = await harness.delegation.steer('job-1', 'try the other approach')
-    assert.equal(steer.supported, false)
-    assert.match(steer.supported === false ? steer.reason : '', /Cancel the job and re-delegate/)
     assert.equal(typeof harness.delegation.onEvent(() => {}), 'function')
   })
 })
@@ -304,6 +301,7 @@ describe('the events capability probe', () => {
     const harness = await setup()
     assert.equal((await harness.delegation.capabilities()).canReport, true)
     assert.deepEqual(of(harness, 'events').map((entry) => entry.argv), [['events', '--help']])
+    assert.deepEqual(of(harness, 'steer').map((entry) => entry.argv), [['steer', '--help']])
   })
 
   it('reports canReport false for a consult with no events command', async () => {
@@ -462,5 +460,99 @@ describe('watch()', () => {
     harness.delegation.watch('job-1', () => {})
     await new Promise((resolve) => setTimeout(resolve, 600))
     assert.equal(of(harness, 'events').filter((entry) => entry.argv.includes('--follow')).length, 1)
+  })
+})
+
+describe('steer()', () => {
+  it('probes for the command and reports it as a capability', async () => {
+    const supported = await setup()
+    assert.equal((await supported.delegation.capabilities()).canSteer, true)
+    const absent = await setup({ FAKE_CONSULT_NO_STEER: '1' })
+    assert.equal((await absent.delegation.capabilities()).canSteer, false)
+  })
+
+  it('delivers guidance and reports it accepted', async () => {
+    const harness = await setup()
+    const outcome = await harness.delegation.steer('job-1', 'skip the migration; the schema is frozen')
+    assert.deepEqual(outcome, { supported: true, accepted: true, detail: 'steered job-1' })
+    const steer = of(harness, 'steer').find((entry) => entry.argv[1] === 'job-1')
+    assert.deepEqual(steer?.argv, ['steer', 'job-1', '--message', 'skip the migration; the schema is frozen'])
+  })
+
+  it('reports a consult without the command as unsupported, without spawning a steer', async () => {
+    const harness = await setup({ FAKE_CONSULT_NO_STEER: '1' })
+    const outcome = await harness.delegation.steer('job-1', 'go left')
+    assert.equal(outcome.supported, false)
+    assert.match(outcome.supported === false ? outcome.reason : '', /no `steer` command/)
+    assert.deepEqual(of(harness, 'steer').map((entry) => entry.argv), [['steer', '--help']])
+  })
+
+  it('reports an unsteerable delegation as unsupported', async () => {
+    const harness = await setup({ FAKE_CONSULT_EXIT_STEER: '1' })
+    const outcome = await harness.delegation.steer('job-1', 'go left')
+    assert.equal(outcome.supported, false)
+    assert.match(outcome.supported === false ? outcome.reason : '', /inline runner/)
+  })
+
+  it('reports a steer already in flight as not accepted, and never retries it', async () => {
+    const harness = await setup({ FAKE_CONSULT_EXIT_STEER: '3' })
+    const outcome = await harness.delegation.steer('job-1', 'go left')
+    assert.deepEqual(outcome, { supported: true, accepted: false, detail: 'STEER_PENDING: a previous steer is still being delivered' })
+    // A duplicate steer is worse than a missed one: exit 3 is the one place
+    // this plugin does NOT apply its single contention retry.
+    assert.equal(of(harness, 'steer').filter((entry) => entry.argv[1] === 'job-1').length, 1)
+  })
+
+  it('reports a delegation outside its running window as not accepted', async () => {
+    const harness = await setup({ FAKE_CONSULT_EXIT_STEER: '5' })
+    const outcome = await harness.delegation.steer('job-1', 'go left')
+    assert.equal(outcome.supported === true && outcome.accepted, false)
+    assert.match((outcome as { detail?: string }).detail ?? '', /already finalized/)
+  })
+
+  it('lets an unknown job out as an infrastructure failure', async () => {
+    const harness = await setup({ FAKE_CONSULT_EXIT_STEER: '2' })
+    await assert.rejects(harness.delegation.steer('nope', 'go left'), (error: unknown) =>
+      error instanceof Error && !(error instanceof DelegationError))
+  })
+
+  it('rejects oversized guidance before spawning anything', async () => {
+    const harness = await setup()
+    await assert.rejects(harness.delegation.steer('job-1', 'x'.repeat(16 * 1024 + 1)), (error: unknown) =>
+      error instanceof Error && /the limit is 16384/.test(error.message))
+    assert.equal(harness.invocations().length, 0, 'nothing ran: consult rejects rather than trims, so this is a caller bug')
+  })
+
+  it('rejects empty guidance', async () => {
+    const harness = await setup()
+    await assert.rejects(harness.delegation.steer('job-1', '   '), /non-empty/)
+  })
+
+  it('steers a delegation consult can no longer start new work for', async () => {
+    // Same reasoning as events(): redirecting a delegation that is already
+    // running needs a usable binary, not the ability to delegate.
+    const harness = await setup({ FAKE_CONSULT_DOCTOR_OK: '0' })
+    assert.equal((await harness.delegation.capabilities()).ready, false)
+    assert.equal((await harness.delegation.steer('job-1', 'go left')).supported, true)
+  })
+
+  it('refuses to steer when the binary itself is unusable', async () => {
+    const harness = await setup({ FAKE_CONSULT_VERSION: '0.12.0' })
+    await assert.rejects(harness.delegation.steer('job-1', 'go left'), (error: unknown) =>
+      error instanceof DelegationError && error.code === 'not-ready')
+  })
+
+  it('surfaces a steer echo through events() as an informational event', async () => {
+    const harness = await setup({
+      FAKE_CONSULT_EVENTS: JSON.stringify([
+        { kind: 'report', type: 'progress', at: 'a', seq: 1, message: 'reading' },
+        { kind: 'steer', type: 'steer', at: 'b', seq: 2, message: 'skip the migration' },
+        { kind: 'lifecycle', type: 'terminal', at: 'c', status: 'completed' },
+      ]),
+    })
+    const page = await harness.delegation.events('job-1')
+    assert.deepEqual(page.events.map((event) => event.type), ['progress', 'steer', 'lifecycle'])
+    assert.equal(page.events[1]?.urgency, 'info')
+    assert.equal(page.nextSeq, 2, 'steers share the report sequence space')
   })
 })
