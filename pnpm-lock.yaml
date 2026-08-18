@@ -32,6 +32,9 @@ importers:
       '@deepseek-ai/dsh-subprocess-local':
         specifier: link:../dev/deepseek-harness/packages/subprocess/subprocess-local
         version: link:../dev/deepseek-harness/packages/subprocess/subprocess-local
+      '@deepseek-ai/dsh-system-prompt':
+        specifier: link:../dev/deepseek-harness/packages/core/system-prompt
+        version: link:../dev/deepseek-harness/packages/core/system-prompt
       '@deepseek-ai/dsh-tools':
         specifier: link:../dev/deepseek-harness/packages/core/tools
         version: link:../dev/deepseek-harness/packages/core/tools
