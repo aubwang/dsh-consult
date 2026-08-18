@@ -11,6 +11,7 @@
  * that survives the subprocess seam unchanged:
  *
  *   FAKE_CONSULT_VERSION        version printed by `--version`      (default 1.0.0)
+ *   FAKE_CONSULT_VERSION_EXIT   make `--version` fail with this code (a pre-1.0 install)
  *   FAKE_CONSULT_DOCTOR_OK      '0' makes doctor report canDelegate:false
  *   FAKE_CONSULT_DOCTOR_FAIL_FIRST  number of leading doctor calls that report canDelegate:false
  *   FAKE_CONSULT_EXIT_<CMD>     force one subcommand's exit code (e.g. FAKE_CONSULT_EXIT_DELEGATE=3)
@@ -39,10 +40,13 @@ const counter = bumpCounter(command)
 const forced = forcedExit(command, counter)
 
 switch (command) {
-  case '--version':
+  case '--version': {
+    const versionExit = process.env.FAKE_CONSULT_VERSION_EXIT
+    if (versionExit !== undefined) exitWith(Number(versionExit), 'unknown subcommand: --version\n')
     out(`${process.env.FAKE_CONSULT_VERSION ?? '1.0.0'}\n`)
     exit(0)
     break
+  }
   case 'doctor':
     doctor()
     break
