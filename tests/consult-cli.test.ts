@@ -8,15 +8,20 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  boundJson,
   boundLines,
   boundText,
   buildConsultEnv,
   delegateArgs,
+  eventsArgs,
   gateConsultVersion,
   mapExit,
   parseDoctorReport,
+  parseEventLine,
+  parseEventsEnvelope,
   parseJobCollection,
   parseJobEnvelope,
+  projectEvent,
   projectJob,
   projectResult,
   reviewArgs,
@@ -304,5 +309,127 @@ describe('bounding', () => {
     assert.equal(bounded.truncated, true)
     assert.equal(bounded.text, 'line 7\nline 8\nline 9')
     assert.equal(boundLines(text, 100, 10_000).truncated, false)
+  })
+})
+
+describe('event argv', () => {
+  it('always asks for JSON and only sends --since when it means something', () => {
+    assert.deepEqual(eventsArgs('job-7'), ['events', 'job-7', '--json'])
+    assert.deepEqual(eventsArgs('job-7', { sinceSeq: 0 }), ['events', 'job-7', '--json'])
+    assert.deepEqual(eventsArgs('job-7', { follow: true, sinceSeq: 4 }), ['events', 'job-7', '--json', '--follow', '--since', '4'])
+  })
+})
+
+describe('projectEvent', () => {
+  const report = (type: string, extra: Record<string, unknown> = {}) =>
+    projectEvent({ kind: 'report', type, at: '2026-08-18T00:00:02.000Z', seq: 1, message: 'hi', ...extra }, 'job-7', 1000)
+
+  it('wakes for the types that mean the delegation cannot progress', () => {
+    assert.equal(report('blocked')?.urgency, 'wake')
+    assert.equal(report('decision_needed')?.urgency, 'wake')
+  })
+
+  it('informs for the types that can wait for the next step', () => {
+    assert.equal(report('discovery')?.urgency, 'info')
+    assert.equal(report('progress')?.urgency, 'info')
+  })
+
+  it('carries seq, timing, message, and data through', () => {
+    const event = report('discovery', { data: { file: 'a.ts' } })
+    assert.deepEqual(event, {
+      jobId: 'job-7',
+      seq: 1,
+      at: '2026-08-18T00:00:02.000Z',
+      type: 'discovery',
+      urgency: 'info',
+      message: 'hi',
+      data: { file: 'a.ts' },
+    })
+  })
+
+  it('bounds a long delegate message', () => {
+    const event = projectEvent({ kind: 'report', type: 'progress', at: 'x', seq: 1, message: 'z'.repeat(5000) }, 'job-7', 100)
+    assert.ok(Buffer.byteLength(event?.message ?? '', 'utf8') < 200)
+    assert.match(event?.message ?? '', /more bytes not shown/)
+  })
+
+  it('projects lifecycle transitions as informational, with no sequence', () => {
+    const running = projectEvent({ kind: 'lifecycle', type: 'running', at: 'x' }, 'job-7', 1000)
+    assert.deepEqual(running, { jobId: 'job-7', at: 'x', type: 'lifecycle', urgency: 'info', message: 'delegation job-7 running', lifecycle: { phase: 'running' } })
+    const terminal = projectEvent({ kind: 'lifecycle', type: 'terminal', at: 'y', status: 'failed', errorMessage: 'ran out of context' }, 'job-7', 1000)
+    assert.equal(terminal?.seq, undefined)
+    assert.deepEqual(terminal?.lifecycle, { phase: 'terminal', status: 'failed', errorMessage: 'ran out of context' })
+  })
+
+  it('drops shapes it does not recognize rather than inventing an event', () => {
+    assert.equal(projectEvent({ kind: 'report', type: 'gossip', at: 'x', seq: 1, message: 'hi' }, 'job-7', 1000), undefined)
+    assert.equal(projectEvent({ kind: 'lifecycle', type: 'hibernating', at: 'x' }, 'job-7', 1000), undefined)
+    assert.equal(projectEvent({ kind: 'something-new', type: 'blocked', at: 'x' }, 'job-7', 1000), undefined)
+    assert.equal(projectEvent('not an object', 'job-7', 1000), undefined)
+  })
+})
+
+describe('parseEventsEnvelope', () => {
+  const envelope = (events: unknown[], overrides: Record<string, unknown> = {}) =>
+    JSON.stringify({ schemaVersion: 1, jobId: 'job-7', events, ...overrides })
+
+  it('projects every recognized event in emission order', () => {
+    const events = parseEventsEnvelope(envelope([
+      { kind: 'lifecycle', type: 'running', at: 'a' },
+      { kind: 'report', type: 'blocked', at: 'b', seq: 1, message: 'stuck' },
+      { kind: 'report', type: 'unheard-of', at: 'c', seq: 2, message: 'x' },
+    ]), 1000)
+    assert.deepEqual(events.map((event) => event.type), ['lifecycle', 'blocked'])
+  })
+
+  it('refuses an unknown events schema version', () => {
+    assert.throws(() => parseEventsEnvelope(envelope([], { schemaVersion: 2 }), 1000), (error: unknown) =>
+      error instanceof DelegationError && error.code === 'internal' && /events schemaVersion 2/.test(error.message))
+  })
+
+  it('refuses an envelope missing its job id or events array', () => {
+    assert.throws(() => parseEventsEnvelope(JSON.stringify({ schemaVersion: 1, events: [] }), 1000), DelegationError)
+    assert.throws(() => parseEventsEnvelope(JSON.stringify({ schemaVersion: 1, jobId: 'job-7' }), 1000), DelegationError)
+  })
+})
+
+describe('parseEventLine', () => {
+  const line = (event: unknown, overrides: Record<string, unknown> = {}) =>
+    JSON.stringify({ schemaVersion: 1, jobId: 'job-7', event, ...overrides })
+
+  it('unwraps one framed follow event', () => {
+    const event = parseEventLine(line({ kind: 'report', type: 'blocked', at: 'a', seq: 2, message: 'stuck' }), 1000)
+    assert.equal(event?.seq, 2)
+    assert.equal(event?.urgency, 'wake')
+  })
+
+  it('drops a partial or malformed line instead of failing the stream', () => {
+    // A follow stream is read while it is written, so half a line is routine.
+    assert.equal(parseEventLine('{"schemaVersion":1,"jobId":"job-7","eve', 1000), undefined)
+    assert.equal(parseEventLine('', 1000), undefined)
+    assert.equal(parseEventLine('   ', 1000), undefined)
+    assert.equal(parseEventLine('not json at all', 1000), undefined)
+  })
+
+  it('drops a line framed at an unknown version', () => {
+    assert.equal(parseEventLine(line({ kind: 'report', type: 'blocked', at: 'a', seq: 1, message: 'x' }, { schemaVersion: 9 }), 1000), undefined)
+  })
+})
+
+describe('boundJson', () => {
+  it('passes a payload that fits through untouched', () => {
+    assert.deepEqual(boundJson({ a: 1 }, 1000), { a: 1 })
+  })
+
+  it('replaces an oversized payload with a readable prefix rather than a pruned object', () => {
+    const bounded = boundJson({ blob: 'x'.repeat(5000) }, 100)
+    assert.equal(typeof bounded, 'string')
+    assert.match(bounded as string, /more bytes not shown/)
+  })
+
+  it('survives a payload that cannot be encoded', () => {
+    const cyclic: Record<string, unknown> = {}
+    cyclic.self = cyclic
+    assert.equal(boundJson(cyclic, 1000), '[unencodable delegate data]')
   })
 })

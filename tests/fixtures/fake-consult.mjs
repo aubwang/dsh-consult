@@ -23,6 +23,11 @@
  *   FAKE_CONSULT_DELAY_MS       sleep before answering (slow exit for wait)
  *   FAKE_CONSULT_LOG_LINES      lines the transcript starts with               (default 3)
  *   FAKE_CONSULT_LOG_GROW       lines the transcript gains per `logs` call     (default 0)
+ *   FAKE_CONSULT_NO_EVENTS      '1' removes the `events` command (a pre-report consult build)
+ *   FAKE_CONSULT_EVENTS         JSON array of raw events served by `events`   (default: a full job)
+ *   FAKE_CONSULT_EVENT_STEP_MS  delay between streamed follow events          (default 40)
+ *   FAKE_CONSULT_FOLLOW_DIE_AFTER  events the FIRST follow emits before exiting 4
+ *   FAKE_CONSULT_EVENTS_SCHEMA_VERSION  schemaVersion stamped on event framing (default 1)
  *   FAKE_CONSULT_BAD_JSON       '1' makes job-bearing commands print non-envelope JSON
  *   FAKE_CONSULT_SCHEMA_VERSION schemaVersion stamped on envelopes             (default 1)
  *   FAKE_CONSULT_STATE          JSON file holding per-command invocation counters
@@ -82,6 +87,9 @@ switch (command) {
     out(logs())
     exit(0)
     break
+  case 'events':
+    await events()
+    break
   case 'cancel':
     if (forced !== undefined) exitWith(forced, 'cancel failed\n')
     out(`cancelled ${argv[1]}\n`)
@@ -89,6 +97,61 @@ switch (command) {
     break
   default:
     exitWith(2, `unknown subcommand: ${command}\n`)
+}
+
+function defaultEvents() {
+  return [
+    { kind: 'lifecycle', type: 'queued', at: '2026-08-18T00:00:00.000Z' },
+    { kind: 'lifecycle', type: 'running', at: '2026-08-18T00:00:01.000Z' },
+    { kind: 'report', type: 'progress', at: '2026-08-18T00:00:02.000Z', seq: 1, message: 'reading src/server.ts' },
+    { kind: 'report', type: 'blocked', at: '2026-08-18T00:00:03.000Z', seq: 2, message: 'need a decision on the retry policy', data: { options: ['a', 'b'] } },
+    { kind: 'report', type: 'discovery', at: '2026-08-18T00:00:04.000Z', seq: 3, message: 'a second call site exists' },
+    { kind: 'lifecycle', type: 'terminal', at: '2026-08-18T00:00:09.000Z', status: 'completed' },
+  ]
+}
+
+async function events() {
+  // A consult without the report/events work treats `events` as an unknown
+  // subcommand, exactly like any other unrecognized verb.
+  if (process.env.FAKE_CONSULT_NO_EVENTS === '1') exitWith(2, 'unknown subcommand: events\n')
+  if (argv.includes('--help')) {
+    out('Usage:\n  consult events <job-id> [--since <seq>] [--json]\n')
+    exit(0)
+  }
+  const jobId = argv[1]
+  if (jobId === undefined || jobId.startsWith('--')) exitWith(2, 'job id is required\n')
+  if (forced !== undefined) exitWith(forced, 'events failed\n')
+
+  const since = Number(flagValue('--since') ?? '0')
+  const all = process.env.FAKE_CONSULT_EVENTS === undefined
+    ? defaultEvents()
+    : JSON.parse(process.env.FAKE_CONSULT_EVENTS)
+  // Upstream semantics: --since filters reports only; lifecycle transitions
+  // carry no seq and are always replayed so a reconnecting reader still learns
+  // the job ended.
+  const selected = all.filter((event) => event.seq === undefined || event.seq > since)
+  const version = Number(process.env.FAKE_CONSULT_EVENTS_SCHEMA_VERSION ?? '1')
+
+  if (!argv.includes('--follow')) {
+    out(`${JSON.stringify({ schemaVersion: version, jobId, events: selected })}\n`)
+    exit(0)
+  }
+
+  const step = Number(process.env.FAKE_CONSULT_EVENT_STEP_MS ?? '40')
+  const dieAfter = process.env.FAKE_CONSULT_FOLLOW_DIE_AFTER
+  // Counted separately from `events --help` (the capability probe) and from
+  // non-follow reads, so a scenario means "the FIRST follow dies".
+  const followCount = bumpCounter('events-follow')
+  const dieAt = dieAfter !== undefined && followCount === 1 ? Number(dieAfter) : Number.POSITIVE_INFINITY
+  let emitted = 0
+  for (const event of selected) {
+    if (emitted >= dieAt) exitWith(4, `timed out following job ${jobId}\n`)
+    out(`${JSON.stringify({ schemaVersion: version, jobId, event })}\n`)
+    emitted += 1
+    if (step > 0) await new Promise((resolve) => setTimeout(resolve, step))
+  }
+  if (emitted >= dieAt) exitWith(4, `timed out following job ${jobId}\n`)
+  exit(0)
 }
 
 function doctor() {

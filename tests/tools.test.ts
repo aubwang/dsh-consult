@@ -18,7 +18,10 @@ import type { ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
 import LocalJobRegistry from '@deepseek-ai/dsh-jobs-local'
 import { JobId } from '@deepseek-ai/dsh-jobs'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import AgentRegistry from '@deepseek-ai/dsh-agent'
+import type { Agent } from '@deepseek-ai/dsh-agent'
+import { CallId, type UserMessage } from '@deepseek-ai/dsh-llm'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import { ConsultDelegation, type Config as ProviderConfig } from '../src/provider.ts'
 import * as DelegateTools from '../src/tools.ts'
 
@@ -32,8 +35,24 @@ interface Recorded {
 
 interface Harness {
   ctx: Context
-  call(name: string, args: Record<string, unknown>): Promise<ToolExecutionResult>
+  call(name: string, args: Record<string, unknown>, agent?: Agent): Promise<ToolExecutionResult>
   invocations(): Recorded[]
+  /** Register a fake owner whose delivery lanes the test can observe. */
+  owner(sessionId: string, delivery?: FakeDelivery): FakeOwner
+}
+
+/** How one fake owner behaves when a notice arrives. */
+interface FakeDelivery {
+  /** Defaults to `running` — the lane that never wakes — so a test pins one lane deliberately. */
+  status?: 'idle' | 'running'
+}
+
+interface FakeOwner {
+  agent: Agent
+  injected: UserMessage[]
+  followedUp: UserMessage[]
+  /** Simulate the owner claiming human input, which refills the wake budget. */
+  claimUserInput(): void
 }
 
 interface SetupOptions {
@@ -53,7 +72,12 @@ async function setup(options: SetupOptions = {}): Promise<Harness> {
   const record = join(dir, 'record.jsonl')
   writeFileSync(record, '')
   const ctx = new Context()
-  const fibers = [await ctx.plugin(SystemPrompt), await ctx.plugin(ToolRuntime), await ctx.plugin(LocalSubprocessRuntime)]
+  const fibers = [
+    await ctx.plugin(SystemPrompt),
+    await ctx.plugin(ToolRuntime),
+    await ctx.plugin(LocalSubprocessRuntime),
+    await ctx.plugin(AgentRegistry),
+  ]
   if (options.withJobs !== false) {
     fibers.push(await ctx.plugin(LocalJobRegistry))
     // dsh-tool-jobs normally attaches the controller; the tools under test only
@@ -74,13 +98,43 @@ async function setup(options: SetupOptions = {}): Promise<Harness> {
   })
   return {
     ctx,
-    call: (name, args) => ctx.tools.execute({
+    call: (name, args, agent) => ctx.tools.execute({
       callId: CallId(`call-${(callSequence += 1)}`),
       name,
       arguments: args,
       signal,
+      ...agent !== undefined ? { agent } : {},
     }),
     invocations: () => readFileSync(record, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as Recorded),
+    owner: (sessionId, delivery = {}) => {
+      const injected: UserMessage[] = []
+      const followedUp: UserMessage[] = []
+      const scope = ctx.plugin(() => {})
+      const id = SessionId(sessionId)
+      const agent = {
+        id,
+        ctx: scope.ctx,
+        status: delivery.status ?? 'running',
+        inject: (message: UserMessage) => injected.push(message),
+        followup: (message: UserMessage) => followedUp.push(message),
+        session: { id, header: { version: 0, id, createdAt: 0 } },
+      } as unknown as Agent
+      const detach = ctx.agents.register(agent)
+      teardown.push(async () => {
+        detach()
+        await scope.dispose()
+      })
+      return {
+        agent,
+        injected,
+        followedUp,
+        claimUserInput: () => ctx.emit('agent/inbox/claimed', {
+          agent,
+          message: { source: { kind: 'user' } } as unknown as UserMessage,
+          turn: 1,
+        }),
+      }
+    },
   }
 }
 
@@ -275,5 +329,132 @@ describe('delegate_status, delegate_result, delegate_logs', () => {
     const harness = await setup()
     assert.equal((await harness.call('delegate_logs', { job_id: 'job-1', tail: 0 })).isError, true)
     assert.equal((await harness.call('delegate_logs', { job_id: 'job-1', tail: 'lots' })).isError, true)
+  })
+})
+
+describe('delegation event delivery', () => {
+  /** Poll until the owner has received `count` messages across both lanes. */
+  const untilDelivered = (owner: FakeOwner, count: number) =>
+    until(() => owner.injected.length + owner.followedUp.length >= count ? true : undefined)
+
+  it('wakes an idle owner for a report that blocks the delegation', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_EVENT_STEP_MS: '20', FAKE_CONSULT_DELAY_MS: '5000' } })
+    const owner = harness.owner('session-idle', { status: 'idle' })
+    await harness.call('delegate', { prompt: 'p' }, owner.agent)
+    await untilDelivered(owner, 3)
+    assert.deepEqual(owner.followedUp.length, 1, 'exactly the blocked report opened a turn')
+    const woken = owner.followedUp[0]
+    assert.equal(woken?.source.kind, 'plugin')
+    assert.match(String((woken?.content[0] as { text: string }).text), /reported: blocked/)
+    assert.match(String((woken?.content[0] as { text: string }).text), /untrusted-delegate-output/)
+  })
+
+  it('injects into a busy owner instead of interrupting it', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_EVENT_STEP_MS: '20', FAKE_CONSULT_DELAY_MS: '5000' } })
+    const owner = harness.owner('session-busy', { status: 'running' })
+    await harness.call('delegate', { prompt: 'p' }, owner.agent)
+    await untilDelivered(owner, 3)
+    assert.equal(owner.followedUp.length, 0)
+    assert.equal(owner.injected.length, 3, 'progress, blocked, and discovery all joined the next step')
+  })
+
+  it('delivers nothing for lifecycle transitions, which the jobs runtime already announces', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_EVENT_STEP_MS: '20', FAKE_CONSULT_DELAY_MS: '5000' } })
+    const owner = harness.owner('session-lifecycle', { status: 'idle' })
+    await harness.call('delegate', { prompt: 'p' }, owner.agent)
+    await untilDelivered(owner, 3)
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    const all = [...owner.injected, ...owner.followedUp]
+    assert.equal(all.length, 3, 'three reports, and none of the three lifecycle transitions')
+    assert.equal(all.some((message) => /reported: lifecycle/.test(String((message.content[0] as { text: string }).text))), false)
+  })
+
+  it('degrades to injection once the wake budget is spent, and refills it on human input', async () => {
+    const wakes = [
+      { kind: 'lifecycle', type: 'running', at: 'a' },
+      { kind: 'report', type: 'blocked', at: 'b', seq: 1, message: 'first' },
+      { kind: 'report', type: 'decision_needed', at: 'c', seq: 2, message: 'second' },
+      { kind: 'report', type: 'blocked', at: 'd', seq: 3, message: 'third' },
+      { kind: 'lifecycle', type: 'terminal', at: 'e', status: 'completed' },
+    ]
+    const harness = await setup({
+      scenario: { FAKE_CONSULT_EVENT_STEP_MS: '20', FAKE_CONSULT_DELAY_MS: '5000', FAKE_CONSULT_EVENTS: JSON.stringify(wakes) },
+      tools: { wakeBudget: 2 },
+    })
+    const owner = harness.owner('session-budget', { status: 'idle' })
+    await harness.call('delegate', { prompt: 'p' }, owner.agent)
+    await untilDelivered(owner, 3)
+    assert.equal(owner.followedUp.length, 2, 'the budget bounds the self-exciting chain')
+    assert.equal(owner.injected.length, 1, 'the third wake degrades to injection')
+
+    owner.claimUserInput()
+    await harness.call('delegate', { prompt: 'again' }, owner.agent)
+    await until(() => owner.followedUp.length > 2 ? true : undefined)
+    assert.ok(owner.followedUp.length > 2, 'human input refills the budget')
+  })
+
+  it('never wakes when the budget is zero', async () => {
+    const harness = await setup({
+      scenario: { FAKE_CONSULT_EVENT_STEP_MS: '20', FAKE_CONSULT_DELAY_MS: '5000' },
+      tools: { wakeBudget: 0 },
+    })
+    const owner = harness.owner('session-nowake', { status: 'idle' })
+    await harness.call('delegate', { prompt: 'p' }, owner.agent)
+    await untilDelivered(owner, 3)
+    assert.equal(owner.followedUp.length, 0)
+    assert.equal(owner.injected.length, 3)
+  })
+
+  it('bounds the notice summary to the context-summary budget', async () => {
+    const harness = await setup({
+      scenario: {
+        FAKE_CONSULT_EVENT_STEP_MS: '20',
+        FAKE_CONSULT_DELAY_MS: '5000',
+        FAKE_CONSULT_EVENTS: JSON.stringify([
+          { kind: 'report', type: 'blocked', at: 'a', seq: 1, message: 'x'.repeat(4000) },
+          { kind: 'lifecycle', type: 'terminal', at: 'b', status: 'completed' },
+        ]),
+      },
+      tools: { outputLimitBytes: 500 },
+    })
+    const owner = harness.owner('session-bounds', { status: 'idle' })
+    await harness.call('delegate', { prompt: 'p' }, owner.agent)
+    await untilDelivered(owner, 1)
+    const message = owner.followedUp[0]
+    const summary = (message?.source as { summary?: string }).summary ?? ''
+    assert.ok(summary.length <= 120, `summary was ${summary.length} chars`)
+    const body = String((message?.content[0] as { text: string }).text)
+    assert.ok(Buffer.byteLength(body, 'utf8') <= 500, `body was ${Buffer.byteLength(body, 'utf8')} bytes`)
+    assert.match(body, /notice truncated/)
+  })
+
+  it('starts no follow for an unowned delegation', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_EVENT_STEP_MS: '20' } })
+    await harness.call('delegate', { prompt: 'p' })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(harness.invocations().filter((entry) => entry.argv.includes('--follow')).length, 0)
+  })
+
+  it('starts no follow when the configured consult has no events command', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_NO_EVENTS: '1', FAKE_CONSULT_EVENT_STEP_MS: '20' } })
+    const owner = harness.owner('session-noevents', { status: 'idle' })
+    await harness.call('delegate', { prompt: 'p' }, owner.agent)
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    assert.deepEqual([...owner.injected, ...owner.followedUp], [])
+    assert.equal(harness.invocations().filter((entry) => entry.argv.includes('--follow')).length, 0)
+  })
+
+  it('stops following once the delegation is collected', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_EVENT_STEP_MS: '600' } })
+    const owner = harness.owner('session-stop', { status: 'running' })
+    const started = value(await harness.call('delegate', { prompt: 'p' }, owner.agent))
+    // The job is owned, so the read is authorized by its owner.
+    await harness.ctx.jobs.wait(JobId(started.backgroundJobId as string), 20_000, owner.agent)
+    // jobs.wait and the collector's own teardown observe the same settlement;
+    // let the unsubscribe run before snapshotting what was delivered.
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    const delivered = owner.injected.length
+    await new Promise((resolve) => setTimeout(resolve, 900))
+    assert.equal(owner.injected.length, delivered, 'a collected delegation delivers nothing further')
   })
 })
