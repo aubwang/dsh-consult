@@ -18,6 +18,10 @@
       "types": "./lib/types/provider.d.ts",
       "default": "./lib/provider.js"
     },
+    "./toy-provider": {
+      "types": "./lib/types/toy-provider.d.ts",
+      "default": "./lib/toy-provider.js"
+    },
     "./tools": {
       "types": "./lib/types/tools.d.ts",
       "default": "./lib/tools.js"
