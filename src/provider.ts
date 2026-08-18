@@ -309,7 +309,19 @@ export class ConsultDelegation extends DelegationService {
       return { ready: false, usable: false, profiles: [], canReport: false, canSteer: false, ...gate.version !== undefined ? { version: gate.version } : {}, diagnosis: gate.reason }
     }
 
-    const doctorRun = await runConsult(this.spawn, ['doctor', '--json'], invocation).catch(() => undefined)
+    // Doctor checks ONE authority, and it defaults to consult's own
+    // (read-only, confined). Probing that instead of the authority this
+    // deployment is configured for rejects a perfectly working install for a
+    // check it never performs — an `inherit` deployment against a profile
+    // consult never confines is the standard case.
+    const doctorArgs = [
+      'doctor',
+      '--json',
+      this.config.defaultMode === 'write' ? '--write' : '--read-only',
+      '--sandbox',
+      this.config.sandbox,
+    ]
+    const doctorRun = await runConsult(this.spawn, doctorArgs, invocation).catch(() => undefined)
     if (doctorRun === undefined) {
       return { ready: false, usable: true, version: gate.version, profiles: [], canReport: false, canSteer: false, diagnosis: 'could not run `consult doctor --json`' }
     }
