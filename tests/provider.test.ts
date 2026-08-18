@@ -326,9 +326,26 @@ describe('the events capability probe', () => {
     assert.deepEqual(of(harness, 'events').map((entry) => entry.argv), [['events', '--help']])
   })
 
-  it('refuses to read events at all while preflight is not ready', async () => {
+  it('refuses to read events when the binary itself is unusable', async () => {
     const harness = await setup({ FAKE_CONSULT_VERSION: '0.12.0' })
     await assert.rejects(harness.delegation.events('job-1'), (error: unknown) =>
+      error instanceof DelegationError && error.code === 'not-ready')
+  })
+
+  it('still reads events when consult cannot start NEW delegations', async () => {
+    // Observation must not be gated on the ability to delegate: a supervisor
+    // whose profile configuration broke mid-flight would otherwise go blind to
+    // the delegation that is still running.
+    const harness = await setup({ FAKE_CONSULT_DOCTOR_OK: '0' })
+    assert.equal((await harness.delegation.capabilities()).ready, false)
+    const page = await harness.delegation.events('job-1')
+    assert.equal(page.supported, true)
+    assert.equal(page.events.length, 6)
+    const received: DelegationEvent[] = []
+    harness.delegation.watch('job-1', (event) => received.push(event))
+    await until(() => received.some((event) => event.lifecycle?.phase === 'terminal') ? true : undefined)
+    // ...while starting a new delegation still refuses, with doctor's diagnosis.
+    await assert.rejects(harness.delegation.delegate({ prompt: 'p' }), (error: unknown) =>
       error instanceof DelegationError && error.code === 'not-ready')
   })
 })

@@ -108,6 +108,13 @@ type ResolvedConfig =
 /** Memoized preflight state: what `--version`, `doctor`, and `agents` reported. */
 interface PreflightState {
   ready: boolean
+  /**
+   * Whether the configured binary is a consult this plugin can talk to at all:
+   * it resolved, ran, and passed the semver gate. Independent of whether a
+   * profile is configured — reading an existing delegation needs a usable
+   * binary, not the ability to start a new delegation.
+   */
+  usable: boolean
   version?: string
   profiles: string[]
   defaultProfile?: string
@@ -255,6 +262,7 @@ export class ConsultDelegation extends DelegationService {
     } catch (error) {
       return {
         ready: false,
+        usable: false,
         profiles: [],
         canReport: false,
         diagnosis: `could not resolve the consult executable ${JSON.stringify(this.config.consultPath)}: `
@@ -268,6 +276,7 @@ export class ConsultDelegation extends DelegationService {
     } catch (error) {
       return {
         ready: false,
+        usable: false,
         profiles: [],
         canReport: false,
         diagnosis: `could not run \`consult --version\`: ${error instanceof Error ? error.message : String(error)}`,
@@ -279,6 +288,7 @@ export class ConsultDelegation extends DelegationService {
       const output = (versionRun.stderr.trim().length > 0 ? versionRun.stderr : versionRun.stdout).trim().split('\n')[0] ?? ''
       return {
         ready: false,
+        usable: false,
         profiles: [],
         canReport: false,
         diagnosis: `\`${this.config.consultPath} --version\` exited ${versionRun.exitCode ?? 'by signal'} (${output.slice(0, 200)}). `
@@ -288,12 +298,12 @@ export class ConsultDelegation extends DelegationService {
     }
     const gate = gateConsultVersion(versionRun.stdout)
     if (!gate.ok) {
-      return { ready: false, profiles: [], canReport: false, ...gate.version !== undefined ? { version: gate.version } : {}, diagnosis: gate.reason }
+      return { ready: false, usable: false, profiles: [], canReport: false, ...gate.version !== undefined ? { version: gate.version } : {}, diagnosis: gate.reason }
     }
 
     const doctorRun = await runConsult(this.spawn, ['doctor', '--json'], invocation).catch(() => undefined)
     if (doctorRun === undefined) {
-      return { ready: false, version: gate.version, profiles: [], canReport: false, diagnosis: 'could not run `consult doctor --json`' }
+      return { ready: false, usable: true, version: gate.version, profiles: [], canReport: false, diagnosis: 'could not run `consult doctor --json`' }
     }
     const doctor = parseDoctorReport(doctorRun.stdout, doctorRun.stderr)
     const roster = await this.probeProfiles(invocation)
@@ -301,6 +311,7 @@ export class ConsultDelegation extends DelegationService {
     if (!doctor.canDelegate) {
       return {
         ready: false,
+        usable: true,
         version: gate.version,
         profiles: roster.profiles,
         canReport,
@@ -312,6 +323,7 @@ export class ConsultDelegation extends DelegationService {
     const defaultProfile = doctor.selectedProfile ?? roster.defaultProfile ?? this.config.defaultProfile
     return {
       ready: true,
+      usable: true,
       version: gate.version,
       profiles: roster.profiles,
       canReport,
@@ -474,8 +486,12 @@ export class ConsultDelegation extends DelegationService {
     fromSeq?: number,
     options?: DelegationCallOptions,
   ): Promise<DelegationEventPage> {
+    // Observation is deliberately NOT gated on doctor's canDelegate. Reading a
+    // delegation's events needs a usable consult binary and nothing else; a
+    // supervisor whose profile configuration broke while a delegation was in
+    // flight must not go blind to what that delegation is reporting.
     const state = await this.preflight(options)
-    if (!state.ready) {
+    if (!state.usable) {
       throw new DelegationError('not-ready', 'delegation is unavailable', {
         ...state.diagnosis !== undefined ? { detail: state.diagnosis } : {},
       })
@@ -518,7 +534,9 @@ export class ConsultDelegation extends DelegationService {
       // events command never spawns anything.
       const starting = watch
       void this.preflight(options).then((state) => {
-        if (state.ready && state.canReport && !starting.closed) this.startFollow(id, starting)
+        // Same reasoning as events(): a usable binary with the events command
+        // is the whole requirement for following a delegation already running.
+        if (state.usable && state.canReport && !starting.closed) this.startFollow(id, starting)
         else this.closeWatch(id, starting)
       }, () => this.closeWatch(id, starting))
     }
