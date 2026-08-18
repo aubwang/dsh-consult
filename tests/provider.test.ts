@@ -495,6 +495,21 @@ describe('watch()', () => {
     assert.equal(observed.every((event) => event.jobId === 'job-1'), true)
   })
 
+  it('follows again from scratch after a delegation already ran to its terminal transition', async () => {
+    // A spent watch is a record, not a subscription to join: attaching to it
+    // would add a listener nothing will ever call.
+    const harness = await setup({ FAKE_CONSULT_EVENT_STEP_MS: '20' })
+    const first: DelegationEvent[] = []
+    harness.delegation.watch('job-1', (event) => first.push(event))
+    await until(() => first.some((event) => event.lifecycle?.phase === 'terminal') ? true : undefined)
+
+    const second: DelegationEvent[] = []
+    harness.delegation.watch('job-1', (event) => second.push(event))
+    await until(() => second.some((event) => event.lifecycle?.phase === 'terminal') ? true : undefined)
+    assert.equal(second.length, 6, 'the second watcher got its own complete stream')
+    assert.equal(of(harness, 'events').filter((entry) => entry.argv.includes('--follow')).length, 2)
+  })
+
   it('gives up on an unknown job instead of restarting forever', async () => {
     const harness = await setup({ FAKE_CONSULT_EXIT_EVENTS: '2' }, { eventFollowRestartMs: 100 })
     harness.delegation.watch('job-1', () => {})
