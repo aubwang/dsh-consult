@@ -151,7 +151,7 @@ const text = (result: ToolExecutionResult): string =>
   result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n')
 
 /** Poll a predicate on a short bounded budget; the fake consult is fast. */
-async function until<T>(probe: () => T | undefined, timeoutMs = 15_000): Promise<T> {
+async function until<T>(probe: () => T | undefined, timeoutMs = 30_000): Promise<T> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const found = probe()

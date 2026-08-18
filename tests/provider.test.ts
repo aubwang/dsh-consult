@@ -110,6 +110,22 @@ describe('preflight', () => {
       error instanceof DelegationError && error.code === 'not-ready' && /0\.12\.0/.test(error.detail ?? ''))
   })
 
+  it('asks doctor about the authority this deployment actually uses', async () => {
+    // Doctor checks ONE authority and defaults to consult's own (read-only,
+    // confined). Probing that instead of the configured one rejects a working
+    // install for a check it never performs — an `inherit` deployment against a
+    // profile consult never confines is the standard case.
+    const harness = await setup({}, { sandbox: 'inherit', defaultMode: 'write' })
+    await harness.delegation.capabilities()
+    assert.deepEqual(of(harness, 'doctor')[0]?.argv, ['doctor', '--json', '--write', '--sandbox', 'inherit'])
+  })
+
+  it('defaults the doctor probe to read-only confined, matching the config defaults', async () => {
+    const harness = await setup()
+    await harness.delegation.capabilities()
+    assert.deepEqual(of(harness, 'doctor')[0]?.argv, ['doctor', '--json', '--read-only', '--sandbox', 'confined'])
+  })
+
   it('quotes doctor\'s own diagnosis when consult cannot delegate', async () => {
     const harness = await setup({ FAKE_CONSULT_DOCTOR_OK: '0' })
     const capabilities = await harness.delegation.capabilities()
@@ -121,11 +137,14 @@ describe('preflight', () => {
   it('memoizes a healthy preflight but re-probes after a failure', async () => {
     const harness = await setup({ FAKE_CONSULT_DOCTOR_FAIL_FIRST: '1' })
     assert.equal((await harness.delegation.capabilities()).ready, false)
-    assert.equal((await harness.delegation.capabilities()).ready, true)
-    assert.equal(of(harness, 'doctor').length, 2)
+    assert.equal((await harness.delegation.capabilities()).ready, true, 'the failed probe was not cached')
+    // Count from the first healthy probe rather than from zero: a loaded box
+    // can make an earlier probe fail for its own reasons, and the property
+    // under test is that a HEALTHY preflight is not repeated.
+    const afterHealthy = of(harness, 'doctor').length
     await harness.delegation.capabilities()
     await harness.delegation.status()
-    assert.equal(of(harness, 'doctor').length, 2, 'a healthy preflight is probed once')
+    assert.equal(of(harness, 'doctor').length, afterHealthy, 'a healthy preflight is probed once')
   })
 })
 
