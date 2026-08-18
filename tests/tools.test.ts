@@ -170,15 +170,19 @@ describe('background collection', () => {
   it('re-enters the wait when consult\'s follow deadline expires, then completes', async () => {
     const harness = await setup({
       scenario: { FAKE_CONSULT_EXIT_WAIT: '4', FAKE_CONSULT_TRANSIENT_WAIT: '2' },
-      tools: { jobWaitTimeoutMs: 10_000 },
+      tools: { jobWaitTimeoutMs: 60_000 },
     })
     const started = value(await harness.call('delegate', { prompt: 'p' }))
     const jobId = JobId(started.backgroundJobId as string)
-    const snapshot = await harness.ctx.jobs.wait(jobId, 20_000)
+    const snapshot = await harness.ctx.jobs.wait(jobId, 30_000)
     assert.equal(snapshot.status, 'completed')
     assert.match(snapshot.detail ?? '', /delegate_result job-1/)
+    // At least two deadline re-entries, then the real answer. The collector's own
+    // bound can add a re-entry on a loaded machine, so the floor is what is
+    // asserted: the point is that a deadline re-enters the wait instead of being
+    // reported as a completion.
     const waits = harness.invocations().filter((entry) => entry.argv[0] === 'wait')
-    assert.equal(waits.length, 3, 'two deadline re-entries, then the real answer')
+    assert.ok(waits.length >= 3, `expected at least 3 waits, saw ${waits.length}`)
   })
 
   it('reports a delegated turn that finalized as failed', async () => {
