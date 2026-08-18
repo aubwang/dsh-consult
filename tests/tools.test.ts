@@ -127,7 +127,16 @@ describe('delegate', () => {
     const started = value(await harness.call('delegate', { prompt: 'p' }))
     assert.equal(started.kind, 'started')
     assert.equal(started.backgroundJobId, undefined)
-    assert.match(text(await harness.call('delegate', { prompt: 'p' })), /No background job service is mounted/)
+    assert.match(started.trackingNote as string, /no background job service is mounted/)
+    assert.match(text(await harness.call('delegate', { prompt: 'p' })), /Not tracked as a background job/)
+  })
+
+  it('keeps the job id when tracking is turned off, and says why', async () => {
+    const harness = await setup({ tools: { trackJobs: false } })
+    const started = value(await harness.call('delegate', { prompt: 'p' }))
+    assert.equal(started.kind, 'started')
+    assert.equal(started.backgroundJobId, undefined)
+    assert.match(started.trackingNote as string, /trackJobs: false/)
   })
 
   it('carries the model\'s authority selectors into the delegation', async () => {

@@ -118,6 +118,12 @@ function toFailure(error: unknown): FailureValue {
   }
 }
 
+/** Whether a delegation ended up tracked as a dsh background job, and why not when it did not. */
+interface Tracking {
+  jobId?: string
+  reason?: string
+}
+
 /** Project a seam job onto the canonical tool value. */
 function jobValue(job: DelegationJob) {
   return {
@@ -261,13 +267,33 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   /**
    * Publish one delegation as a `ctx.jobs` background job.
-   * @returns the dsh job id, or undefined when no jobs service is mounted.
+   *
+   * The delegation already exists on the provider side by the time this runs,
+   * so a registration failure must never lose the job id: it degrades to the
+   * untracked answer with the reason attached, exactly like an absent jobs
+   * service.
+   * @returns the dsh job id, or the reason there is none.
    */
-  const track = (job: DelegationJob, exec: ToolRunContext, options: DelegationCallOptions): string | undefined => {
-    if (!resolved.trackJobs) return undefined
+  const track = (job: DelegationJob, exec: ToolRunContext, options: DelegationCallOptions): Tracking => {
+    if (!resolved.trackJobs) return { reason: 'background tracking is disabled for this deployment (trackJobs: false)' }
     const jobs = ctx.get('jobs')
-    if (jobs === undefined) return undefined
+    if (jobs === undefined) return { reason: 'no background job service is mounted' }
     const controller = new AbortController()
+    try {
+      return { jobId: startTracking(jobs, job, exec, options, controller) }
+    } catch (error) {
+      controller.abort()
+      return { reason: `background tracking could not start: ${noticeLine(error instanceof Error ? error.message : String(error), 200)}` }
+    }
+  }
+
+  const startTracking = (
+    jobs: NonNullable<ReturnType<typeof ctx.get<'jobs'>>>,
+    job: DelegationJob,
+    exec: ToolRunContext,
+    options: DelegationCallOptions,
+    controller: AbortController,
+  ): string => {
     return jobs.start({
       kind: 'delegate',
       label: job.label ?? `${job.kind ?? 'delegate'} ${job.id} (${job.profile})`,
@@ -290,10 +316,12 @@ export function apply(ctx: Context, config: Config = {}): void {
     })
   }
 
-  const startedNote = (tracked: string | undefined): string =>
-    tracked === undefined
-      ? 'No background job service is mounted, so no completion notice will arrive: poll with delegate_status and read the answer with delegate_result.'
-      : `Tracked as background job ${tracked}: you will be notified when it finishes. Tail it with job_output ${tracked}, stop it with job_kill ${tracked}.`
+  const startedNote = (tracked: Tracking): string =>
+    tracked.jobId === undefined
+      ? `Not tracked as a background job (${tracked.reason ?? 'unknown reason'}), so no completion notice will arrive: `
+        + 'check with delegate_status and read the answer with delegate_result.'
+      : `Tracked as background job ${tracked.jobId}: you will be notified when it finishes. `
+        + `Tail it with job_output ${tracked.jobId}, stop it with job_kill ${tracked.jobId}.`
 
   const START_OUTPUT = {
     oneOf: [
@@ -303,7 +331,8 @@ export function apply(ctx: Context, config: Config = {}): void {
         properties: {
           kind: { type: 'string', required: true, const: 'started' },
           job: { type: 'object', required: true, additionalProperties: false, properties: JOB_PROPERTIES },
-          backgroundJobId: { type: 'string', description: 'The dsh job id tracking this delegation, when a jobs service is mounted.' },
+          backgroundJobId: { type: 'string', description: 'The dsh job id tracking this delegation; absent when nothing tracks it.' },
+          trackingNote: { type: 'string', description: 'Why the delegation is untracked, when backgroundJobId is absent.' },
         },
       },
       { type: 'object', additionalProperties: false, properties: FAILURE_PROPERTIES },
@@ -343,7 +372,10 @@ export function apply(ctx: Context, config: Config = {}): void {
         type: 'text',
         text: value.kind === 'failure'
           ? renderFailure(value.code, value.message, value.detail)
-          : `${jobLine(value.job as DelegationJob)}\n${startedNote(value.backgroundJobId)}`,
+          : `${jobLine(value.job as DelegationJob)}\n${startedNote({
+            ...value.backgroundJobId !== undefined ? { jobId: value.backgroundJobId } : {},
+            ...value.trackingNote !== undefined ? { reason: value.trackingNote } : {},
+          })}`,
       }],
     },
     async execute(args, exec) {
@@ -369,7 +401,8 @@ export function apply(ctx: Context, config: Config = {}): void {
       return {
         kind: 'started' as const,
         job: jobValue(job),
-        ...tracked !== undefined ? { backgroundJobId: tracked } : {},
+        ...tracked.jobId !== undefined ? { backgroundJobId: tracked.jobId } : {},
+        ...tracked.jobId === undefined && tracked.reason !== undefined ? { trackingNote: tracked.reason } : {},
       }
     },
     presentCall: (args) => presentStart('delegate', args.label ?? noticeLine(args.prompt, 120)),
@@ -396,7 +429,10 @@ export function apply(ctx: Context, config: Config = {}): void {
         type: 'text',
         text: value.kind === 'failure'
           ? renderFailure(value.code, value.message, value.detail)
-          : `${jobLine(value.job as DelegationJob)}\n${startedNote(value.backgroundJobId)}`,
+          : `${jobLine(value.job as DelegationJob)}\n${startedNote({
+            ...value.backgroundJobId !== undefined ? { jobId: value.backgroundJobId } : {},
+            ...value.trackingNote !== undefined ? { reason: value.trackingNote } : {},
+          })}`,
       }],
     },
     async execute(args, exec) {
@@ -420,7 +456,8 @@ export function apply(ctx: Context, config: Config = {}): void {
       return {
         kind: 'started' as const,
         job: jobValue(job),
-        ...tracked !== undefined ? { backgroundJobId: tracked } : {},
+        ...tracked.jobId !== undefined ? { backgroundJobId: tracked.jobId } : {},
+        ...tracked.jobId === undefined && tracked.reason !== undefined ? { trackingNote: tracked.reason } : {},
       }
     },
     presentCall: (args) => presentStart('delegate_review', args.label ?? (args.job_id ?? args.base ?? 'current change')),
