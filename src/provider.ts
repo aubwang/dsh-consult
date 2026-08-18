@@ -32,6 +32,8 @@ import {
   runConsult,
   runConsultWithRetry,
   steerArgs,
+  CONSULT_EXTENSIONS,
+  type ConsultSandbox,
   mapSteerExit,
   MAX_STEER_GUIDANCE_BYTES,
   type ConsultInvocation,
@@ -49,7 +51,6 @@ import {
   type DelegationJobId,
   type DelegationMode,
   type DelegationResult,
-  type DelegationSandbox,
   type ReviewSpec,
   type SteerOutcome,
 } from './seam.ts'
@@ -77,8 +78,8 @@ export interface Config {
   defaultProfile?: string
   /** Authority applied when a delegate call omits `mode`. */
   defaultMode?: DelegationMode
-  /** Confinement applied when a call omits `sandbox`. */
-  sandbox?: DelegationSandbox
+  /** Confinement applied when a call omits the `sandbox` extension. */
+  sandbox?: ConsultSandbox
   /** Per-stream in-memory cap for every consult invocation; overflow keeps the tail. */
   maxOutputBytes?: number
   /** Byte cap for each model-facing delegate-authored text field (`finalText`, log tails). */
@@ -494,6 +495,8 @@ export class ConsultDelegation extends DelegationService {
       ...state.defaultProfile !== undefined ? { defaultProfile: state.defaultProfile } : {},
       canSteer: state.canSteer,
       canReport: state.canReport,
+      canReview: true,
+      extensions: CONSULT_EXTENSIONS,
       ...state.activeFromEarlierSessions > 0 ? { activeFromEarlierSessions: state.activeFromEarlierSessions } : {},
       ...state.diagnosis !== undefined ? { diagnosis: state.diagnosis } : {},
     }
