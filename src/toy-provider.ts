@@ -79,6 +79,8 @@ interface ToyRecord {
   submittedAt: string
   finishedAt?: string
   finalText?: string
+  /** True when ANY layer dropped bytes: the stdout collector, or the model-facing bound. */
+  finalTextTruncated: boolean
   errorMessage?: string
   transcript: string[]
   handle: SubprocessHandle | undefined
@@ -151,6 +153,7 @@ export class ToyDelegation extends DelegationService {
       ...spec.label !== undefined ? { label: spec.label } : {},
       mode: spec.mode ?? 'read-only',
       submittedAt: new Date().toISOString(),
+      finalTextTruncated: false,
       transcript: [`[${new Date().toISOString()}] queued`],
       handle: undefined,
       settled: Promise.resolve(),
@@ -167,7 +170,12 @@ export class ToyDelegation extends DelegationService {
     const handle = this.ctx.subprocess.spawn({
       argv: [process.execPath, '-e', TOY_SCRIPT],
       cwd: this.config.cwd ?? options?.cwd ?? process.cwd(),
-      stdio: { stdin: 'ignore', stdout: { maxBytes: this.config.maxTextBytes }, stderr: { maxBytes: 4_096 } },
+      // The collector gets headroom over the model-facing budget on purpose, so
+      // that in the ordinary case `boundText` is the layer that truncates — it
+      // keeps the HEAD and states what it dropped, whereas the collector keeps
+      // the tail silently. A delegate that overruns even this still loses bytes
+      // in the collector, which is why the read's `lossy` flag is consulted too.
+      stdio: { stdin: 'ignore', stdout: { maxBytes: this.collectBytes() }, stderr: { maxBytes: 4_096 } },
       graceMs: this.config.graceMs,
       env: { TOY_PROMPT: prompt, TOY_DELAY_MS: String(this.config.delayMs) },
     })
@@ -176,10 +184,19 @@ export class ToyDelegation extends DelegationService {
     record.transcript.push(`[${new Date().toISOString()}] running`)
     void handle.done.then(
       (outcome) => {
-        const text = handle.collected.stdout?.readFrom(0).text.trim() ?? ''
+        const read = handle.collected.stdout?.readFrom(0)
         if (record.status === 'cancelled') return
         if (outcome.exitCode === 0) {
-          record.finalText = boundText(text, this.config.maxTextBytes, 'head').text
+          const bounded = boundText(read?.text.trim() ?? '', this.config.maxTextBytes, 'head')
+          record.finalText = bounded.text
+          // Two layers can shorten an answer, and the caller must never be
+          // handed a short one that claims to be complete. `lossy` means the
+          // collector's window slid — which, because the collector is sized
+          // above the model-facing budget, also guarantees the retained tail
+          // still overruns that budget, so `boundText` has already written the
+          // marker. The flag is the OR because the FACT of truncation belongs
+          // to the record, not to whichever layer happened to notice it.
+          record.finalTextTruncated = bounded.truncated || (read?.lossy ?? false)
           this.finish(record, 'completed')
           return
         }
@@ -201,6 +218,15 @@ export class ToyDelegation extends DelegationService {
     record.transcript.push(`[${record.finishedAt}] ${status}`)
     if (record.finalText !== undefined) record.transcript.push(record.finalText)
     record.handle?.terminate()
+  }
+
+  /**
+   * In-memory cap for a delegation's stdout. Double the model-facing budget, so
+   * an answer that overruns the budget is trimmed by the layer that marks the
+   * trim rather than by the one that drops bytes silently.
+   */
+  private collectBytes(): number {
+    return this.config.maxTextBytes * 2
   }
 
   private require(id: DelegationJobId): ToyRecord {
@@ -228,7 +254,9 @@ export class ToyDelegation extends DelegationService {
   private projectResult(record: ToyRecord): DelegationResult {
     return {
       ...this.project(record),
-      ...record.finalText !== undefined ? { finalText: record.finalText, finalTextTruncated: false } : {},
+      ...record.finalText !== undefined
+        ? { finalText: record.finalText, finalTextTruncated: record.finalTextTruncated }
+        : {},
       ...record.errorMessage !== undefined ? { errorMessage: record.errorMessage } : {},
     }
   }

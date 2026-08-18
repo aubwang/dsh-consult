@@ -189,6 +189,42 @@ describe('the tools against a provider that is not consult', () => {
     assert.match(text(review), /\[review-unsupported]/)
   })
 
+  it('reports a truncated answer as truncated, whichever layer dropped the bytes', async () => {
+    // Two layers can shorten an answer: the stdout collector, which keeps a
+    // tail silently, and the model-facing bound, which keeps the head and says
+    // what it dropped. A caller must never be handed a short answer that claims
+    // to be complete, so the flag has to be true if EITHER fired.
+    const harness = await setup({ delayMs: 20, maxTextBytes: 256 })
+    const owner = harness.owner('toy-session-8')
+
+    // Over the model-facing budget, under the collector's: the bound truncates.
+    const modest = startedJobId(await harness.call('delegate', { prompt: 'm'.repeat(300) }, owner.agent))
+    await harness.ctx.delegation.wait([modest], 20_000)
+    const bounded = value(await harness.call('delegate_result', { job_id: modest }))
+    assert.equal(bounded.finalTextTruncated, true)
+    assert.match(bounded.finalText as string, /more bytes not shown/)
+
+    // Over BOTH: the collector slid first, and the loss is still reported.
+    const huge = startedJobId(await harness.call('delegate', { prompt: 'h'.repeat(4_000) }, owner.agent))
+    await harness.ctx.delegation.wait([huge], 20_000)
+    const dropped = value(await harness.call('delegate_result', { job_id: huge }))
+    assert.equal(dropped.finalTextTruncated, true)
+    // The collector is sized above the model-facing budget precisely so the
+    // marker is still written by the layer that keeps the head.
+    assert.match(dropped.finalText as string, /more bytes not shown/)
+    assert.ok(Buffer.byteLength(dropped.finalText as string, 'utf8') < 512)
+  })
+
+  it('leaves an answer that fits marked as complete', async () => {
+    const harness = await setup({ delayMs: 20, maxTextBytes: 4_000 })
+    const owner = harness.owner('toy-session-9')
+    const jobId = startedJobId(await harness.call('delegate', { prompt: 'short' }, owner.agent))
+    await harness.ctx.delegation.wait([jobId], 20_000)
+    const result = value(await harness.call('delegate_result', { job_id: jobId }))
+    assert.equal(result.finalTextTruncated, false)
+    assert.equal(/not shown/.test(result.finalText as string), false)
+  })
+
   it('surfaces spec fields the provider cannot honor instead of ignoring them', async () => {
     // The seam's DelegateSpec carries options a provider may have no notion of.
     // Refusing is the honest answer; silently dropping `isolated` would let a
