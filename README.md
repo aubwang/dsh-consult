@@ -226,7 +226,7 @@ A consuming delta of the delegation's rendered transcript, in the same untrusted
 
 - **Every spawn goes through `ctx.subprocess.spawn`** — never `node:child_process` — so confinement, the credential scrub, bounded collection with spill, tree-kill escalation, and remote execution worlds apply to delegated work exactly as they do to the bash tool.
 - **Host identity is stamped per spawn.** `CONSULT_HOST=dsh` plus `CONSULT_HOST_SESSION_ID=<calling agent's session id>` scope consult's job records to the agent that started them; without them every agent's jobs would collapse into consult's `terminal/default` host session. The session id reaches the provider through the seam's per-call `DelegationCallOptions`, which the tools fill from `exec.agent`.
-- **Preflight is lazy and memoized.** First use runs `consult --version` (gated at `>=1.0.0 <2.0.0`), then `consult doctor --json`, then `consult agents --json`. A healthy probe is cached; any not-ready outcome clears the cache so the next call re-probes after you fix the install. A missing, stale, or unconfigured consult becomes a `not-ready` domain outcome quoting doctor's own diagnosis — it never crashes the plugin.
+- **Preflight is lazy and memoized.** First use runs `consult --version` (gated at `>=1.0.0 <2.0.0`), then `consult doctor --json` **with the configured authority** (`--read-only`/`--write` and `--sandbox <configured>`, because doctor checks exactly one authority and defaults to consult's own), then `consult agents --json`. A healthy probe is cached; any not-ready outcome clears the cache so the next call re-probes after you fix the install. A missing, stale, or unconfigured consult becomes a `not-ready` domain outcome quoting doctor's own diagnosis — it never crashes the plugin.
 - **Exit codes map to domain outcomes.** `3` is retried exactly once and then reported as `busy`; `4` → `timeout`; `5` → `not-final`; `6` → `delegate-failed`; `8` → `review-unsupported`; `1` and anything unexpected → `internal`. `2` is deliberately an infrastructure throw: every argv is plugin-authored, so a usage error means the plugin or its configuration is wrong.
 - **Only `schemaVersion: 1` envelopes are trusted.** Unknown fields are ignored so the contract can evolve additively; an unknown schema version is refused rather than half-parsed. Non-job JSON (`doctor`, `agents`) is defensively parsed and never fatal.
 - **The plugin never reads consult's private state.** The CLI is the whole contract; the only paths it touches are the ones an envelope hands back.
@@ -238,13 +238,13 @@ A consuming delta of the delegation's rendered transcript, in the same untrusted
 
 ## Compatibility
 
-| dsh-consult | DeepSeek Harness | consult | status |
-|---|---|---|---|
-| 0.1.0 | 0.1.0-rc.7 | 1.0.0 | tested — delegation only; `canReport: false`, `canSteer: false` |
-| 0.1.0 | 0.1.0-rc.7 | 1.0.0 + `report`/`events` | tested — plus upward reports |
-| 0.1.0 | 0.1.0-rc.7 | 1.0.0 + `report`/`events`/`steer` | tested — plus `delegate_steer` |
+| dsh-consult | DeepSeek Harness | consult | capabilities | tested |
+|---|---|---|---|---|
+| 0.1.0 | 0.1.0-rc.7 | released 1.0.0 | delegation only — `canReport: false`, `canSteer: false` | unit + integration |
+| 0.1.0 | 0.1.0-rc.7 | 1.0.0 + `report`/`events` | plus upward reports | unit + integration + `drill/events-live.mjs` |
+| 0.1.0 | 0.1.0-rc.7 | `feat/steer` (report + events + steer) | plus `delegate_steer` | all of the above + `drill/full-loop.mjs` |
 
-Released consult 1.0.0 has neither `report`/`events` nor `steer`; both landed after the tag, and both report `1.0.0` themselves. The plugin therefore detects each command at runtime rather than by version string (see the probe below). Every build works — an older one simply delivers no mid-flight reports and answers `delegate_steer` with `unsupported`.
+Released consult 1.0.0 has neither `report`/`events` nor `steer`; both landed after the tag, and **both report `1.0.0` themselves**. The plugin therefore detects each command at runtime rather than by version string (see the probe below). Every build works — an older one simply delivers no mid-flight reports and answers `delegate_steer` with `unsupported`, while delegation itself is unaffected.
 
 Harness packages are pinned as exact peer dependencies during the rc churn; expect breakage across rc bumps and re-pin per release. The consult range (`>=1.0.0 <2.0.0`) is enforced at preflight, not by npm, because consult is an external CLI rather than a package dependency.
 
@@ -294,6 +294,8 @@ DEEPSEEK_API_KEY=<anything> pnpm dsh --profile headless \
 # → [drill] delegation tools: delegate, delegate_logs, delegate_result, delegate_review, delegate_status
 ```
 
+`drill/full-loop.mjs` is the end-to-end proof, documented in [Full-loop drill](#full-loop-drill) above.
+
 `drill/preflight.mjs` runs the provider's preflight against real consult installs and prints the resulting capabilities — the fastest way to see what a supervisor would be told about a broken or unconfigured install.
 
 `drill/events-live.mjs` exercises the event follow against a real `consult events`. It builds a throwaway `CONSULT_DATA_DIR` workspace with one job record and its log, watches the delegation through the provider, then appends a report and finalizes the record while the follow is live:
@@ -311,17 +313,56 @@ node drill/events-live.mjs /path/to/consult/bin/consult
 
 The same drill exercises the real `consult steer` against those records. A steer that is *accepted* needs a live broker socket behind a real running job, which a drill that fabricates records cannot create; the three refusal families — which are the ones whose exit-code mapping this plugin owns — are all reachable, and the accepted path is covered by the M5 end-to-end loop.
 
+## Full-loop drill
+
+`drill/full-loop.mjs` is the end-to-end proof that the delegation loop closes. It is not part of `pnpm test` — it needs a steer-capable consult on disk — and it runs on demand:
+
+```sh
+pnpm build
+DRILL_CONSULT_BIN=/path/to/consult/bin/consult node drill/full-loop.mjs
+```
+
+```
+consult 1.0.0  ready=true  canReport=true  canSteer=true
+
+a. the supervisor delegates
+  PASS  delegation job-QtgXCbABNqW6 queued and tracked as delegate-1
+
+b. the delegate reports BLOCKED, and the supervisor is woken
+  PASS  a wake-urgency report opened a turn on the idle supervisor, framed as untrusted data
+
+c. the supervisor steers
+  PASS  consult accepted the guidance and re-prompted the same session
+
+d. the delegation completes, carrying the guidance
+  PASS  the delegation completed (never cancelled) and its answer carries USE-APPROACH-B
+
+e. the event stream reads back in order
+   events: lifecycle -> lifecycle -> blocked -> steer -> lifecycle
+  PASS  blocked -> steer -> terminal(completed), sequences monotonic, steer echo never delivered upward
+
+PASS — 5 steps proven in 3s
+```
+
+**What is actually running.** Only the model is fake. A real Cordis composition mounts the real subprocess, tools, jobs, and agent services; the real provider drives the real consult CLI; consult starts a real detached worker and a real job-scoped broker; and `drill/fake-delegate.mjs` answers as a real ACP agent over real JSON-RPC stdio, registered as a real consult profile. The delegate reports upward by shelling out to the real `consult report`, and the steer is a real broker `consult/steer` that cancels and re-prompts the live turn.
+
+**What it proves that unit tests cannot.** That the supervisor is woken by a delegate that is genuinely stuck rather than by a canned event; that a steer survives the cancel-and-re-prompt round trip with the delegation keeping its id and finishing `completed` rather than `cancelled`; and that the guidance text reaches the model, because the delegate echoes it back and the drill asserts the token in `finalText`.
+
+**Requirements.** A consult with `report`, `events`, and `steer`. Everything lives in a throwaway `CONSULT_DATA_DIR` and git workspace, both removed on success; no consult state on the machine is read or written. It must run where **unix sockets can be created under the temp directory** — a background delegation is served by a broker listening on one, and the worker is spawned `stdio: 'ignore'`, so a sandbox that denies `listen(2)` leaves every job silently at `queued`. That is the first thing to check if the drill hangs at step b.
+
 ## Known Limitations and Deferred Work
 
-- **No steering.** `delegate_steer` does not exist and `ctx.delegation.steer()` answers `{supported: false}`: consult 1.x has no steer command. The documented fallback is cancel plus re-delegate. Arrives with M3 (upstream `consult steer`) + M4 (the tool).
+- **Steering needs a consult that has it.** Against a consult without `steer`, `capabilities().canSteer` is false and `delegate_steer` returns an `unsupported` outcome. The tool is still registered, so the model gets a real answer rather than a missing capability.
 - **Upward reports need a consult that has them.** Against a consult without `report`/`events`, `capabilities().canReport` is false, `events()` returns a typed unsupported page, and nothing follows anything — the supervisor learns the outcome at completion, exactly as before. There is no fallback that synthesizes reports from the transcript.
 - **A delegate only reports if it is asked to.** `consult report` is a command the delegated agent must choose to run, so a prompt that never mentions it produces lifecycle events and nothing else. Confined delegations cannot execute anything at all, so mid-flight reporting is an inherit-sandbox capability today.
 - **Only background, non-isolated delegations can be steered.** A foreground delegate and an `--isolated` job both run their turn in-process with no broker socket to reach, so consult refuses them with `unsupported`. That is a consult boundary, not a plugin one. Everything this plugin starts is background, so the practical limit is `isolated: true`.
 - **Steering is an interruption, not a conversation.** The delegate's current turn is stopped and re-prompted; there is no reply channel and no acknowledgement beyond the exit code. A steer that consult accepted may still be ignored by the delegate.
 - **`status`, `result`, and `logs` still require full readiness**, unlike `events`, `watch`, and `steer`. The same argument for ungating applies to them, but changing their semantics was out of scope for the event and steer work; it is a deliberate, known asymmetry rather than an oversight.
-- **`job_output` transcript reads are polled, not pushed.** The jobs seam's `readOutput` hook is synchronous while the delegation seam exposes the transcript as an asynchronous bounded tail, so background collection refreshes it on a `logPollIntervalMs` timer and on each read. Each refresh spawns one short-lived `consult logs`. M4 replaces the poll with the pushed event stream.
+- **`job_output` transcript reads are polled, not pushed.** The jobs seam's `readOutput` hook is synchronous while the delegation seam exposes the transcript as an asynchronous bounded tail, so background collection refreshes it on a `logPollIntervalMs` timer and on each read. Each refresh spawns one short-lived `consult logs`. The event stream did NOT replace this: events carry what a delegate deliberately reports, while the transcript carries its tool activity, and only the transcript answers `job_output`. Folding the two into one follow process is a plausible future simplification, not something the event work delivered.
 - **The transcript cursor can report a gap.** It anchors on the last line already delivered; if more than `logWindowLines` lines are rendered between refreshes, the anchor slides out of the window and the read is marked as a gap rather than replaying or skipping silently. Widen the window or shorten the poll for very chatty delegates; the full transcript is always available through `delegate_logs`.
 - **Confined delegations cannot execute anything.** That is consult's own boundary, not this plugin's: confined jobs are denied every execute kind, so a delegate cannot run tests or builds. Verify a returned patch host-side, or grant `sandbox: 'inherit'` deliberately.
+- **Preflight answers for one authority.** Doctor checks a single authority, so preflight asks about the deployment's configured `defaultMode`/`sandbox`. A per-call `mode` or `sandbox` that differs from the configured default is not preflighted; consult still enforces it at delegate time, and a rejected combination surfaces there rather than as `not-ready`.
+- **The full-loop drill needs unix sockets.** consult's background worker talks to a job-scoped broker over one, so a sandbox that denies `listen(2)` leaves delegations silently `queued`. Unit and integration tests are unaffected — they never reach the broker.
 - **Preflight runs `consult doctor`, which really launches the profile.** It stages a credential and initializes/disposes the agent (it sends no model prompt). That is a real cost on first use; it is memoized until it fails.
 - **One package, three modules.** The seam is real from day one, but it is not yet its own npm package. It graduates to a standalone Definition package when a second provider appears — the `./seam` subpath export exists so that move does not break consumers.
 
