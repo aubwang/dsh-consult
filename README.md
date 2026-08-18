@@ -132,11 +132,12 @@ data:
 { "options": ["a", "b"] }
 </untrusted-delegate-output>
 
-This delegation cannot be redirected in place: act on the report, or stop it with job_kill and
-delegate again with the corrected prompt. Read its transcript with delegate_logs job-7.
+Answer it with delegate_steer job-7: your guidance interrupts the current turn and continues the same
+delegation, which keeps its id and its budget. If the steer comes back refused or unsupported, stop it
+with job_kill and delegate again with the answer written into the new prompt. Transcript: delegate_logs job-7.
 ```
 
-The closing line is deliberate: consult has no steer command yet, so the notice names the two things a supervisor can actually do rather than implying a reply channel that does not exist.
+The closing paragraph is capability-aware. Against a steer-capable consult it leads with `delegate_steer`, because redirecting in place keeps the delegation's id, session, and budget, and names the destructive path only as the fallback. Against a consult without `steer` it says the delegation cannot be redirected in place and gives cancel-and-re-delegate as the only advice — a notice never advertises a tool the composition cannot serve.
 
 **Which lane a report takes** is decided by its type, because urgency is a property of what the delegate said rather than of who is listening:
 

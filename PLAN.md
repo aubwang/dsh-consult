@@ -1,6 +1,12 @@
 # dsh-consult — Plan
 
-Status: proposed (not yet approved). Date: 2026-08-18.
+Status: **implemented through M5** (2026-08-18, same day as proposed). All milestones complete:
+- M0+M1+M4: this repo, on `main` — seam + provider + six `delegate*` tools + event delivery + steer, 157 tests, full-loop drill in `drill/` (PASS).
+- M2+M3 (upstream): consult repo branches `feat/report-events` (report/events, ADR-0039) and `feat/steer` (steer, ADR-0040, stacked), 842 tests. Unpushed, unmerged — merge is the maintainer's call.
+- Reviews: every milestone reviewed by gpt-5.6-sol @ xhigh via `consult review` itself; findings (1×P1, 3×P2 actioned, 1 dismissed) all fixed and re-tested.
+Deviations from the plan below are recorded in the repo README (Known Limitations / dev notes) and the upstream ADRs; where they conflict, the code and ADRs are the truth.
+
+Original plan follows. Date: 2026-08-18.
 
 Repos involved:
 - **dsh-consult** (this repo, new): the dsh plugin bundle.
