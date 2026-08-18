@@ -1,0 +1,16 @@
+# Development overlay: load the plugin from this checkout by absolute path,
+# without publishing or installing it. See README "Development setup".
+- insert:
+    - id: consult-delegation
+      name: '/home/dev/dsh-consult/lib/provider.js'
+      config:
+        consultPath: 'node'
+        consultArgs: ['/home/dev/consult/bin/consult']
+
+    - id: tool-delegate
+      name: '/home/dev/dsh-consult/lib/tools.js'
+
+    # Drill-only probe: prints the visible tool names and exits. Remove this
+    # row when using the overlay to actually run an agent.
+    - id: drill-list-tools
+      name: '/home/dev/dsh-consult/drill/list-tools.mjs'

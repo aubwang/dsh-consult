@@ -239,10 +239,15 @@ export class ConsultDelegation extends DelegationService {
       }
     }
     if (versionRun.exitCode !== 0) {
+      // consult grew `--version` in 1.0; an install that rejects the flag is
+      // almost always a pre-1.0 one, which this plugin cannot read anyway.
+      const output = (versionRun.stderr.trim().length > 0 ? versionRun.stderr : versionRun.stdout).trim().split('\n')[0] ?? ''
       return {
         ready: false,
         profiles: [],
-        diagnosis: `\`consult --version\` exited ${versionRun.exitCode ?? 'by signal'}: ${versionRun.stderr.trim().slice(0, 400)}`,
+        diagnosis: `\`${this.config.consultPath} --version\` exited ${versionRun.exitCode ?? 'by signal'} (${output.slice(0, 200)}). `
+          + 'consult only accepts `--version` from 1.0 onwards, so this is most likely a pre-1.0 install; '
+          + 'this plugin supports >=1.0.0 <2.0.0. Upgrade consult, or point the plugin\'s `consultPath` at a 1.x install.',
       }
     }
     const gate = gateConsultVersion(versionRun.stdout)

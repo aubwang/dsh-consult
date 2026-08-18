@@ -96,6 +96,14 @@ describe('preflight', () => {
     assert.equal(of(harness, 'doctor').length, 0)
   })
 
+  it('names a pre-1.0 install when consult does not even accept --version', async () => {
+    const harness = await setup({ FAKE_CONSULT_VERSION_EXIT: '2' })
+    const capabilities = await harness.delegation.capabilities()
+    assert.equal(capabilities.ready, false)
+    assert.match(capabilities.diagnosis ?? '', /most likely a pre-1\.0 install/)
+    assert.equal(of(harness, 'doctor').length, 0)
+  })
+
   it('turns a gate failure into a not-ready domain failure on every call', async () => {
     const harness = await setup({ FAKE_CONSULT_VERSION: '0.12.0' })
     await assert.rejects(harness.delegation.delegate({ prompt: 'p' }), (error: unknown) =>
