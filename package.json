@@ -67,6 +67,7 @@
     "@deepseek-ai/dsh-session": "link:../dev/deepseek-harness/packages/core/session",
     "@deepseek-ai/dsh-subprocess": "link:../dev/deepseek-harness/packages/subprocess/subprocess",
     "@deepseek-ai/dsh-subprocess-local": "link:../dev/deepseek-harness/packages/subprocess/subprocess-local",
+    "@deepseek-ai/dsh-system-prompt": "link:../dev/deepseek-harness/packages/core/system-prompt",
     "@deepseek-ai/dsh-tools": "link:../dev/deepseek-harness/packages/core/tools",
     "@deepseek-ai/schemastery": "link:../dev/deepseek-harness/vendor/schemastery",
     "@types/node": "^24.0.0",
