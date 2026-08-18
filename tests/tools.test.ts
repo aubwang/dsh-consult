@@ -20,10 +20,9 @@ import LocalJobRegistry from '@deepseek-ai/dsh-jobs-local'
 import { JobId } from '@deepseek-ai/dsh-jobs'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { CallId, type UserMessage } from '@deepseek-ai/dsh-llm'
-import { SessionId } from '@deepseek-ai/dsh-session'
 import { ConsultDelegation, type Config as ProviderConfig } from '../src/provider.ts'
 import * as DelegateTools from '../src/tools.ts'
+import { registerOwner, text, toolCaller, until, value, type FakeDelivery, type FakeOwner } from './support.ts'
 
 const FIXTURE = fileURLToPath(new URL('./fixtures/fake-consult.mjs', import.meta.url))
 
@@ -41,20 +40,6 @@ interface Harness {
   owner(sessionId: string, delivery?: FakeDelivery): FakeOwner
 }
 
-/** How one fake owner behaves when a notice arrives. */
-interface FakeDelivery {
-  /** Defaults to `running` — the lane that never wakes — so a test pins one lane deliberately. */
-  status?: 'idle' | 'running'
-}
-
-interface FakeOwner {
-  agent: Agent
-  injected: UserMessage[]
-  followedUp: UserMessage[]
-  /** Simulate the owner claiming human input, which refills the wake budget. */
-  claimUserInput(): void
-}
-
 interface SetupOptions {
   scenario?: Record<string, string>
   provider?: Partial<ProviderConfig>
@@ -64,8 +49,6 @@ interface SetupOptions {
 }
 
 const teardown: Array<() => Promise<void>> = []
-const signal = new AbortController().signal
-let callSequence = 0
 
 async function setup(options: SetupOptions = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-consult-tools-'))
@@ -98,42 +81,12 @@ async function setup(options: SetupOptions = {}): Promise<Harness> {
   })
   return {
     ctx,
-    call: (name, args, agent) => ctx.tools.execute({
-      callId: CallId(`call-${(callSequence += 1)}`),
-      name,
-      arguments: args,
-      signal,
-      ...agent !== undefined ? { agent } : {},
-    }),
+    call: toolCaller(ctx),
     invocations: () => readFileSync(record, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as Recorded),
     owner: (sessionId, delivery = {}) => {
-      const injected: UserMessage[] = []
-      const followedUp: UserMessage[] = []
-      const scope = ctx.plugin(() => {})
-      const id = SessionId(sessionId)
-      const agent = {
-        id,
-        ctx: scope.ctx,
-        status: delivery.status ?? 'running',
-        inject: (message: UserMessage) => injected.push(message),
-        followup: (message: UserMessage) => followedUp.push(message),
-        session: { id, header: { version: 0, id, createdAt: 0 } },
-      } as unknown as Agent
-      const detach = ctx.agents.register(agent)
-      teardown.push(async () => {
-        detach()
-        await scope.dispose()
-      })
-      return {
-        agent,
-        injected,
-        followedUp,
-        claimUserInput: () => ctx.emit('agent/inbox/claimed', {
-          agent,
-          message: { source: { kind: 'user' } } as unknown as UserMessage,
-          turn: 1,
-        }),
-      }
+      const registered = registerOwner(ctx, sessionId, delivery)
+      teardown.push(registered.dispose)
+      return registered.owner
     },
   }
 }
@@ -141,25 +94,6 @@ async function setup(options: SetupOptions = {}): Promise<Harness> {
 after(async () => {
   for (const dispose of teardown) await dispose()
 })
-
-const value = (result: ToolExecutionResult): Record<string, unknown> => {
-  assert.equal(result.isError, false, `expected success, got ${JSON.stringify(result.error)}`)
-  return result.value as Record<string, unknown>
-}
-
-const text = (result: ToolExecutionResult): string =>
-  result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n')
-
-/** Poll a predicate on a short bounded budget; the fake consult is fast. */
-async function until<T>(probe: () => T | undefined, timeoutMs = 30_000): Promise<T> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    const found = probe()
-    if (found !== undefined) return found
-    await new Promise((resolve) => setTimeout(resolve, 25))
-  }
-  throw new Error('condition was not met within the budget')
-}
 
 describe('delegate', () => {
   it('returns a queued job and registers it as a dsh background job', async () => {
