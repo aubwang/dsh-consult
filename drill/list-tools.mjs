@@ -19,11 +19,11 @@ export function apply(ctx) {
   const timer = setInterval(() => {
     const names = ctx.tools.schemas().map((schema) => schema.name).sort()
     const delegation = names.filter((n) => n === 'delegate' || n.startsWith('delegate_'))
-    if (delegation.length < 5 && Date.now() - started < DEADLINE_MS) return
+    if (delegation.length < 6 && Date.now() - started < DEADLINE_MS) return
     clearInterval(timer)
     process.stdout.write(`[drill] visible tools: ${names.join(', ')}\n`)
     process.stdout.write(`[drill] delegation tools: ${delegation.join(', ') || '(none)'}\n`)
-    process.exit(delegation.length === 5 ? 0 : 1)
+    process.exit(delegation.length === 6 ? 0 : 1)
   }, 25)
   timer.unref?.()
   ctx.effect(() => () => clearInterval(timer))
