@@ -6,6 +6,14 @@ Status: **implemented through M5** (2026-08-18, same day as proposed). All miles
 - Reviews: every milestone reviewed by gpt-5.6-sol @ xhigh via `consult review` itself; findings (1×P1, 3×P2 actioned, 1 dismissed) all fixed and re-tested.
 Deviations from the plan below are recorded in the repo README (Known Limitations / dev notes) and the upstream ADRs; where they conflict, the code and ADRs are the truth.
 
+## Post-M5 follow-ups (from external review, 2026-08-18, priority order)
+
+1. **Toy second provider behind `ctx.delegation`** — cheapest insurance that the seam isn't secretly consult-shaped, before reviewer/council plugins depend on it. Highest priority of these.
+2. **Upstream: merge `feat/report-events` + `feat/steer`, cut a release, add `consult capabilities --json`** — replaces the `--help` exit-code capability probes with a first-class contract (probes stay as fallback). Needs the maintainer's merge decision.
+3. **Upstream: inject `report` as a typed tool into the delegate's session** (ACP `session/new` accepts MCP servers; stage a stdio MCP server into the sandbox) — dissolves the confined-jobs-can't-report limitation instead of documenting it. Design work required (sandbox staging).
+4. **Watch surfaced orphans for terminal events** — the reconciliation pass counts prior-session jobs still active at first preflight, but one that finalizes later still completes unobserved; an observation-grade watch on those ids closes it.
+5. **Clean-machine install verification** once DeepSeek publishes current dsh packages to npm (published 0.0.1-rc.1 lags repo 0.1.0-rc.7; exact-pinned peers can't resolve for strangers until then).
+
 Original plan follows. Date: 2026-08-18.
 
 Repos involved:

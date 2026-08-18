@@ -207,6 +207,8 @@ export function apply(ctx: Context, config: Config = {}): void {
   // completion notices, kept as a separate budget because the two answer
   // different questions.
   const spentWakes = new WeakMap<Agent, number>()
+  /** Whether the earlier-sessions announcement has already been made. */
+  let announced = false
   if (resolved.wakeBudget > 0) {
     ctx.on('agent/inbox/claimed', ({ agent, message }) => {
       // Claiming is where human input actually enters a step. A notice this
@@ -358,6 +360,58 @@ export function apply(ctx: Context, config: Config = {}): void {
   }
 
   /**
+   * Tell the supervisor, exactly once, about delegations that were already
+   * running when this session started.
+   *
+   * Delegation state is durable, so a host that crashed leaves its work running
+   * with nobody listening. The provider counts them at preflight; this turns
+   * that count into something the model learns without having to ask. It rides
+   * the first delegation-family tool result as deferred context rather than
+   * living in a canonical value, because `output.render` is a pure function
+   * replayed from the session log — a one-time announcement is not a property
+   * of the result being rendered.
+   *
+   * Nothing is adopted and nothing is cancelled. A background job needs a live
+   * owner agent at registration time and these have none, so the honest thing
+   * to say is that this session will never notify about them.
+   */
+  const announceEarlierSessions = async (exec: ToolRunContext, options: DelegationCallOptions): Promise<void> => {
+    if (announced) return
+    let capabilities
+    try {
+      capabilities = await ctx.delegation.capabilities(options)
+    } catch {
+      return
+    }
+    // Nothing has been reconciled while preflight is failing, so stay quiet and
+    // let a later call announce once the provider comes up.
+    if (!capabilities.ready) return
+    announced = true
+    const active = capabilities.activeFromEarlierSessions ?? 0
+    if (active === 0) return
+    const plural = active === 1 ? 'delegation' : 'delegations'
+    try {
+      exec.deferContext(createUserMessage({
+        content: [{
+          type: 'text',
+          text: `${active} ${plural} from earlier sessions ${active === 1 ? 'is' : 'are'} still active in this workspace — `
+            + 'this session does not track them, so no completion notice will arrive for them. '
+            + `Inspect them with delegate_status and read finished ones with delegate_result. `
+            + 'They are durable and wall-clock-capped by consult, so they end on their own if you leave them.',
+        }],
+        source: {
+          kind: 'plugin',
+          plugin: 'dsh-consult',
+          form: 'notice',
+          summary: boundContextSummary(`${active} ${plural} from earlier sessions still active in this workspace`),
+        },
+      }))
+    } catch {
+      // A context that cannot be deferred is not worth failing a tool call for.
+    }
+  }
+
+  /**
    * Publish one delegation as a `ctx.jobs` background job.
    *
    * The delegation already exists on the provider side by the time this runs,
@@ -484,6 +538,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     },
     async execute(args, exec) {
       const options = callOptions(exec)
+      await announceEarlierSessions(exec, options)
       const spec: DelegateSpec = {
         prompt: args.prompt,
         ...args.profile !== undefined ? { profile: args.profile } : {},
@@ -541,6 +596,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     },
     async execute(args, exec) {
       const options = callOptions(exec)
+      await announceEarlierSessions(exec, options)
       const spec: ReviewSpec = {
         ...args.base !== undefined ? { base: args.base } : {},
         ...args.job_id !== undefined ? { jobId: args.job_id } : {},
@@ -602,8 +658,10 @@ export function apply(ctx: Context, config: Config = {}): void {
       }],
     },
     async execute(args, exec) {
+      const options = callOptions(exec)
+      await announceEarlierSessions(exec, options)
       try {
-        const jobs = await ctx.delegation.status(args.job_id, callOptions(exec))
+        const jobs = await ctx.delegation.status(args.job_id, options)
         return { kind: 'jobs' as const, jobs: jobs.map(jobValue) }
       } catch (error) {
         return toFailure(error)
@@ -670,9 +728,11 @@ export function apply(ctx: Context, config: Config = {}): void {
       }],
     },
     async execute(args, exec) {
+      const options = callOptions(exec)
+      await announceEarlierSessions(exec, options)
       let result: DelegationResult
       try {
-        result = await ctx.delegation.result(args.job_id, callOptions(exec))
+        result = await ctx.delegation.result(args.job_id, options)
       } catch (error) {
         return toFailure(error)
       }
@@ -739,8 +799,10 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (args.tail !== undefined && (!Number.isInteger(args.tail) || args.tail <= 0)) {
         throw new Error(`invalid tail: expected a positive integer, got ${JSON.stringify(args.tail)}`)
       }
+      const options = callOptions(exec)
+      await announceEarlierSessions(exec, options)
       try {
-        const text = await ctx.delegation.logs(args.job_id, args.tail ?? resolved.defaultLogTailLines, callOptions(exec))
+        const text = await ctx.delegation.logs(args.job_id, args.tail ?? resolved.defaultLogTailLines, options)
         return { kind: 'logs' as const, jobId: args.job_id, text }
       } catch (error) {
         return toFailure(error)
@@ -798,9 +860,11 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (args.guidance.trim().length === 0) {
         throw new Error('invalid guidance: expected a non-empty instruction')
       }
+      const options = callOptions(exec)
+      await announceEarlierSessions(exec, options)
       let outcome
       try {
-        outcome = await ctx.delegation.steer(args.job_id, args.guidance, callOptions(exec))
+        outcome = await ctx.delegation.steer(args.job_id, args.guidance, options)
       } catch (error) {
         return toFailure(error)
       }

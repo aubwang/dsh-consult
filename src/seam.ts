@@ -181,6 +181,23 @@ export interface DelegationCapabilities {
   canReport: boolean
   /** Bounded, actionable diagnosis; present whenever `ready` is false. */
   diagnosis?: string
+  /**
+   * Delegations that were already active in this workspace when the provider
+   * first became ready. Because the provider reconciles before this session has
+   * started anything, every one of them belongs to an earlier host session —
+   * typically one that crashed, since delegation state is durable and outlives
+   * the host that started it.
+   *
+   * This is a count to SURFACE, not a set to reclaim. A consumer cannot adopt
+   * these delegations: a host background job is registered against a live owner
+   * agent at registration time, and the agent that owned these is gone, so
+   * there is nothing to register them against and no completion notice can
+   * arrive for them. They remain readable and, being provider-side records,
+   * subject to whatever wall-clock bound the provider enforces.
+   *
+   * Absent or `0` when nothing was active, so a consumer can stay silent.
+   */
+  activeFromEarlierSessions?: number
 }
 
 /**

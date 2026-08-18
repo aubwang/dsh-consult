@@ -448,6 +448,20 @@ const WAKE_TYPES: readonly string[] = ['blocked', 'decision_needed']
 const LIFECYCLE_PHASES = ['queued', 'running', 'terminal'] as const
 
 /**
+ * Count delegations that have not reached a terminal status.
+ *
+ * Only the two explicitly live statuses count. A status this seam version does
+ * not model projects as `unknown`, and guessing that an unrecognized state is
+ * still running would inflate a number whose entire purpose is to tell a
+ * supervisor something needs its attention.
+ * @param jobs - projected job records.
+ * @returns how many are queued or running.
+ */
+export function countActiveDelegations(jobs: readonly DelegationJob[]): number {
+  return jobs.filter((job) => job.status === 'queued' || job.status === 'running').length
+}
+
+/**
  * Build `consult steer` arguments. The guidance goes through `--message`
  * rather than after `--`, so text that begins with a dash cannot be re-read as
  * a flag by anything downstream.

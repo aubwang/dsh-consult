@@ -16,6 +16,7 @@ import type { SubprocessHandle } from '@deepseek-ai/dsh-subprocess'
 import {
   boundLines,
   buildConsultEnv,
+  countActiveDelegations,
   delegateArgs,
   eventsArgs,
   gateConsultVersion,
@@ -125,6 +126,8 @@ interface PreflightState {
   canReport: boolean
   /** Whether the configured consult exposes the `steer` command. */
   canSteer: boolean
+  /** Delegations already active in this workspace when this preflight succeeded. */
+  activeFromEarlierSessions: number
   diagnosis?: string
 }
 
@@ -271,6 +274,7 @@ export class ConsultDelegation extends DelegationService {
         profiles: [],
         canReport: false,
         canSteer: false,
+        activeFromEarlierSessions: 0,
         diagnosis: `could not resolve the consult executable ${JSON.stringify(this.config.consultPath)}: `
           + `${error instanceof Error ? error.message : String(error)}. Install consult, or set the plugin's \`consultPath\`.`,
       }
@@ -286,6 +290,7 @@ export class ConsultDelegation extends DelegationService {
         profiles: [],
         canReport: false,
         canSteer: false,
+        activeFromEarlierSessions: 0,
         diagnosis: `could not run \`consult --version\`: ${error instanceof Error ? error.message : String(error)}`,
       }
     }
@@ -299,6 +304,7 @@ export class ConsultDelegation extends DelegationService {
         profiles: [],
         canReport: false,
         canSteer: false,
+        activeFromEarlierSessions: 0,
         diagnosis: `\`${this.config.consultPath} --version\` exited ${versionRun.exitCode ?? 'by signal'} (${output.slice(0, 200)}). `
           + 'consult only accepts `--version` from 1.0 onwards, so this is most likely a pre-1.0 install; '
           + 'this plugin supports >=1.0.0 <2.0.0. Upgrade consult, or point the plugin\'s `consultPath` at a 1.x install.',
@@ -306,7 +312,7 @@ export class ConsultDelegation extends DelegationService {
     }
     const gate = gateConsultVersion(versionRun.stdout)
     if (!gate.ok) {
-      return { ready: false, usable: false, profiles: [], canReport: false, canSteer: false, ...gate.version !== undefined ? { version: gate.version } : {}, diagnosis: gate.reason }
+      return { ready: false, usable: false, profiles: [], canReport: false, canSteer: false, activeFromEarlierSessions: 0, ...gate.version !== undefined ? { version: gate.version } : {}, diagnosis: gate.reason }
     }
 
     // Doctor checks ONE authority, and it defaults to consult's own
@@ -323,7 +329,7 @@ export class ConsultDelegation extends DelegationService {
     ]
     const doctorRun = await runConsult(this.spawn, doctorArgs, invocation).catch(() => undefined)
     if (doctorRun === undefined) {
-      return { ready: false, usable: true, version: gate.version, profiles: [], canReport: false, canSteer: false, diagnosis: 'could not run `consult doctor --json`' }
+      return { ready: false, usable: true, version: gate.version, profiles: [], canReport: false, canSteer: false, activeFromEarlierSessions: 0, diagnosis: 'could not run `consult doctor --json`' }
     }
     const doctor = parseDoctorReport(doctorRun.stdout, doctorRun.stderr)
     const roster = await this.probeProfiles(invocation)
@@ -339,6 +345,7 @@ export class ConsultDelegation extends DelegationService {
         profiles: roster.profiles,
         canReport,
         canSteer,
+        activeFromEarlierSessions: 0,
         ...roster.defaultProfile !== undefined ? { defaultProfile: roster.defaultProfile } : {},
         diagnosis: `consult cannot delegate right now — ${doctor.diagnosis ?? 'no diagnosis reported'}. `
           + 'Run `consult doctor` in the workspace, and `consult setup --install <profile>` if no profile is configured.',
@@ -352,8 +359,48 @@ export class ConsultDelegation extends DelegationService {
       profiles: roster.profiles,
       canReport,
       canSteer,
+      activeFromEarlierSessions: await this.reconcile(invocation),
       ...defaultProfile !== undefined ? { defaultProfile } : {},
     }
+  }
+
+  /**
+   * Look at what this workspace was already doing before we arrived.
+   *
+   * Delegation state is durable and outlives the host that started it, so a
+   * host that crashed leaves its delegations running with nobody listening.
+   * This runs inside the successful preflight, which is BEFORE this session has
+   * delegated anything — so every active job it finds necessarily belongs to an
+   * earlier session, and no bookkeeping is needed to tell them apart. That
+   * timing is the whole argument; move this call after a delegation and the
+   * count silently starts including our own work.
+   *
+   * It surfaces and does not reap: nothing here cancels, adopts, or otherwise
+   * touches another session's work. The supervisor decides.
+   *
+   * The pass also sweeps stale broker records opportunistically. Every failure
+   * is swallowed, including the command not existing: a reconciliation that
+   * cannot complete must never be the reason delegation is unavailable.
+   * @param invocation - the resolved executable, directory, environment, and budgets.
+   * @returns how many delegations were already active, or 0 when it could not tell.
+   */
+  private async reconcile(invocation: ConsultInvocation): Promise<number> {
+    let active = 0
+    const run = await runConsult(this.spawn, ['status', '--all', '--json'], invocation).catch(() => undefined)
+    if (run !== undefined && run.exitCode === 0) {
+      try {
+        active = countActiveDelegations(parseJobCollection(run.stdout).map(projectJob))
+      } catch {
+        // An unreadable listing is not a reason to fail preflight; a supervisor
+        // that is told nothing is no worse off than before this pass existed.
+        active = 0
+      }
+    }
+    // Broker processes already self-terminate; this only removes their stale
+    // records. Fire and forget, including against a consult that has no such
+    // command.
+    await runConsult(this.spawn, ['brokers', '--cleanup'], invocation).catch(() => undefined)
+    return active
   }
 
   /**
@@ -417,6 +464,7 @@ export class ConsultDelegation extends DelegationService {
       ...state.defaultProfile !== undefined ? { defaultProfile: state.defaultProfile } : {},
       canSteer: state.canSteer,
       canReport: state.canReport,
+      ...state.activeFromEarlierSessions > 0 ? { activeFromEarlierSessions: state.activeFromEarlierSessions } : {},
       ...state.diagnosis !== undefined ? { diagnosis: state.diagnosis } : {},
     }
   }

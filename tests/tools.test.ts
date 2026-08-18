@@ -564,3 +564,54 @@ describe('delegate_steer', () => {
     assert.match(String((all[0]?.content[0] as { text: string }).text), /reported: discovery/)
   })
 })
+
+describe('earlier-session announcement', () => {
+  const contextsOf = (result: ToolExecutionResult): string[] =>
+    (result.additionalContexts ?? []).map((message) =>
+      message.content.map((block) => ('text' in block ? block.text : '')).join('\n'))
+
+  it('tells the model once, on the first delegation-family call', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_ACTIVE_JOBS: '2', FAKE_CONSULT_FINAL_JOBS: '1' } })
+    const first = await harness.call('delegate_status', {})
+    const notice = contextsOf(first)
+    assert.equal(notice.length, 1, `expected one deferred notice, got ${JSON.stringify(notice)}`)
+    assert.match(notice[0] as string, /2 delegations from earlier sessions are still active/)
+    assert.match(notice[0] as string, /no completion notice will arrive for them/)
+    assert.match(notice[0] as string, /delegate_status/)
+    assert.match(notice[0] as string, /wall-clock-capped/)
+  })
+
+  it('never repeats it, whichever tool is called next', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_ACTIVE_JOBS: '2' } })
+    assert.equal(contextsOf(await harness.call('delegate_status', {})).length, 1)
+    assert.equal(contextsOf(await harness.call('delegate_status', {})).length, 0)
+    assert.equal(contextsOf(await harness.call('delegate_logs', { job_id: 'job-1' })).length, 0)
+    assert.equal(contextsOf(await harness.call('delegate', { prompt: 'p' })).length, 0)
+  })
+
+  it('says nothing at all when nothing was left running', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_FINAL_JOBS: '2' } })
+    assert.deepEqual(contextsOf(await harness.call('delegate_status', {})), [])
+  })
+
+  it('uses the singular for one delegation', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_ACTIVE_JOBS: '1' } })
+    const notice = contextsOf(await harness.call('delegate_status', {}))
+    assert.match(notice[0] as string, /1 delegation from earlier sessions is still active/)
+  })
+
+  it('bounds the notice summary', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_ACTIVE_JOBS: '3' } })
+    const result = await harness.call('delegate_status', {})
+    const summary = ((result.additionalContexts ?? [])[0]?.source as { summary?: string } | undefined)?.summary ?? ''
+    assert.ok(summary.length > 0 && summary.length <= 120, `summary was ${summary.length} chars`)
+  })
+
+  it('waits for a healthy preflight instead of announcing zero', async () => {
+    const harness = await setup({ scenario: { FAKE_CONSULT_ACTIVE_JOBS: '2', FAKE_CONSULT_DOCTOR_FAIL_FIRST: '1' } })
+    // The first call cannot know anything: preflight is failing.
+    assert.deepEqual(contextsOf(await harness.call('delegate_status', {})), [])
+    const second = contextsOf(await harness.call('delegate_status', {}))
+    assert.equal(second.length, 1, 'the announcement waits for the provider to come up')
+  })
+})
