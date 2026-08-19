@@ -488,7 +488,8 @@ export function apply(ctx: Context, config: Config = {}): void {
       ? `Not tracked as a background job (${tracked.reason ?? 'unknown reason'}), so no completion notice will arrive: `
         + 'check with delegate_status and read the answer with delegate_result.'
       : `Tracked as background job ${tracked.jobId}: you will be notified when it finishes. `
-        + `Tail it with job_output ${tracked.jobId}, stop it with job_kill ${tracked.jobId}.`
+        + `Two different ids are in play — use ${tracked.jobId} with job_output and job_kill, and the delegation id `
+        + `above with every delegate_* tool.`
 
   const START_OUTPUT = {
     oneOf: [
