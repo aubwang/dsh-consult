@@ -354,6 +354,13 @@ export class ConsultDelegation extends DelegationService {
     const doctorArgs = [
       'doctor',
       '--json',
+      // Doctor selects a profile the same way a delegation does, so a
+      // deployment that names one must say so here too. Omitting it asks
+      // doctor whether a profile NOBODY selected can launch, which reports
+      // "no profile selected" for a configuration that would have delegated
+      // perfectly well — and sends a supervisor off trying to set a global
+      // default it has no business writing.
+      ...this.config.defaultProfile !== undefined ? ['--agent', this.config.defaultProfile] : [],
       this.config.defaultMode === 'write' ? '--write' : '--read-only',
       '--sandbox',
       this.config.sandbox,
