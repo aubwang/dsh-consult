@@ -22,6 +22,12 @@
     - id: tool-delegate
       name: '@aubwang/dsh-consult/tools'
 
+    # CONSUMER #2: the human-triggered `/review` command. Requires ctx.commands
+    # and ctx.delegation. It never triggers itself — automatic review policy
+    # belongs in a separate plugin over the same seam.
+    - id: reviewer
+      name: '@aubwang/dsh-consult/reviewer'
+
 # Swapping the provider is a one-row change, because the consumer talks only to
 # ctx.delegation. A profile's own patch layer can replace the row by id:
 #
