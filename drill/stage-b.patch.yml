@@ -1,0 +1,82 @@
+# Stage-B dogfood overlay: a REAL model supervisor operating the delegation
+# loop by its own tool calls, against a REAL codex delegate.
+#
+# The fake-delegate and live drills prove the plumbing and the real-agent round
+# trip. This proves the part neither can: that a language model, given only the
+# tool schemas and the notices this plugin delivers, chooses to delegate, reads
+# a blocked report, decides, steers, and collects — without a script.
+#
+# It overrides three rows of the `headless` profile by id (each is a top-level
+# row there, so a patch layer re-pins them cleanly) and inserts the two
+# dsh-consult rows by absolute path from this checkout.
+#
+# Run it from a THROWAWAY git repository, because the delegation runs in write
+# mode and its workspace follows the supervisor's cwd:
+#
+#   cd "$(mktemp -d)" && git init -q .
+#   TSX_TSCONFIG_PATH=/home/dev/dev/deepseek-harness/tsconfig.json \
+#   OPENROUTER_API_KEY=<key, inline-scoped to this command> \
+#     node --import /home/dev/dev/deepseek-harness/node_modules/tsx/dist/esm/index.mjs \
+#          /home/dev/dev/deepseek-harness/apps/cli/src/bin.ts \
+#          --profile headless --patch /home/dev/dsh-consult/drill/stage-b.patch.yml \
+#          "<supervisor prompt>"
+#
+# TSX_TSCONFIG_PATH is what lets the source CLI run from a foreign cwd: without
+# it tsx resolves `@deepseek-ai/cordis` to the built lib rather than through the
+# harness's tsconfig paths, and the boot dies on a missing source-only export.
+# The built CLI (apps/cli/lib/bin.js) is not an alternative — it resolves plugin
+# modules from an installed profile directory, which a source checkout has not
+# populated.
+#
+# No key material belongs in this file, and none belongs in a shell history
+# either: the adapter resolves `apiKeyEnv` from the process environment through
+# the credentials service at each request, so scope the value to the one command.
+#
+# KNOWN LIMIT OF THIS COMPOSITION: `headless` is a ONE-SHOT runner. It exits
+# when the first turn ends, and a delegation whose owner agent is disposed is
+# cancelled — so a supervisor that delegates and then waits for a notice is
+# terminated before any notice can arrive. Proving notice-driven supervision
+# needs a surface that outlives one turn (web, or an ACP/JSON-RPC driver).
+
+# An existing row is re-pinned by a bare `- id:` entry; `insert:` is only for
+# rows the composition does not already have, and using it on an existing id
+# fails the boot with "duplicate loader entry id". A patch replaces the row's
+# whole `config`, so each one below restates every key it owns.
+
+# The stock adapter is a plain OpenAI-compatible /chat/completions client, so
+# OpenRouter needs nothing but a base URL and a different credential name.
+# Thinking is off: this run is about tool-call behavior, and the shipped default
+# (full thinking at max effort) is neither needed here nor necessarily accepted
+# through a third-party gateway.
+- id: llm-deepseek
+  config:
+    baseURL: 'https://openrouter.ai/api/v1'
+    apiKeyEnv: OPENROUTER_API_KEY
+    thinking: disabled
+    reasoningEffort: 'off'
+    models:
+      - id: deepseek/deepseek-v4-flash
+        contextWindow: 1048576
+
+# The provider ROUTE name is still `deepseek-official` — that is the adapter's
+# registration, not a statement about the endpoint. Only the model id becomes
+# OpenRouter-shaped.
+- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: deepseek/deepseek-v4-flash
+
+- insert:
+    # `cwd` is deliberately unset: the delegation workspace then follows the
+    # supervisor's session cwd, which is the throwaway repository this is
+    # launched from. `sandbox: inherit` is the deployment default here so
+    # preflight probes the same confinement the delegation will use, and
+    # because a delegate that must run `consult report` cannot be confined.
+    - id: consult-delegation
+      name: '/home/dev/dsh-consult/lib/provider.js'
+      config:
+        sandbox: inherit
+        defaultProfile: codex
+
+    - id: tool-delegate
+      name: '/home/dev/dsh-consult/lib/tools.js'
