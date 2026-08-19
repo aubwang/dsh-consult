@@ -185,6 +185,19 @@ An accepted steer is echoed back into the event stream as a `steer` event. It ap
 
 One small result per call. The guidance itself is model-authored input, capped at consult's 16 KiB and rejected rather than trimmed above it, since a clipped instruction changes what the delegation is being told to do.
 
+### Writing a supervisor prompt
+
+One guardrail belongs in any prompt that supervises delegations: **forbid environment repair.**
+
+```
+If a delegation tool reports not-ready or any failure, stop and report the failure
+verbatim. Do not attempt to repair, configure, or work around the environment.
+```
+
+Every domain outcome this plugin returns is written to be actionable — `not-ready` quotes the provider's own diagnosis, including its remediation. That is right for a human reading a log and a trap for a model reading a tool result: given a diagnosis that names a fix, a capable model will try the fix. Observed behavior includes rewriting the provider's global configuration, escalating sandbox permissions to do it, and inventing CLI invocations — none of which is the supervisor's job, and all of which a correctly configured sandbox will refuse anyway, at the cost of a long and expensive detour.
+
+The diagnosis is still worth surfacing: it is what tells the *operator* what to fix. The prompt is what tells the model that fixing it is not the task.
+
 ### `job_output` reads
 
 #### What the model sees

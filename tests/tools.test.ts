@@ -108,6 +108,10 @@ describe('delegate', () => {
     assert.equal(tracked?.label, 'api audit')
     assert.match(text(result), /Tracked as background job/)
     assert.match(text(result), /job_output/)
+    // A real supervisor took the dsh job id to delegate_steer and got
+    // unknown-job back; the note now says which id belongs to which family.
+    assert.match(text(result), /Two different ids are in play/)
+    assert.match(text(result), /with every delegate_\* tool/)
   })
 
   it('still delegates without a jobs service, and says collection is manual', async () => {
