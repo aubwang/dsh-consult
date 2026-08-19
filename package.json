@@ -26,6 +26,10 @@
       "types": "./lib/types/tools.d.ts",
       "default": "./lib/tools.js"
     },
+    "./reviewer": {
+      "types": "./lib/types/reviewer.d.ts",
+      "default": "./lib/reviewer.js"
+    },
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
@@ -51,6 +55,7 @@
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.0.1",
     "@deepseek-ai/dsh-agent": "0.1.0-rc.7",
+    "@deepseek-ai/dsh-commands": "0.1.0-rc.7",
     "@deepseek-ai/dsh-jobs": "0.1.0-rc.7",
     "@deepseek-ai/dsh-llm": "0.1.0-rc.7",
     "@deepseek-ai/dsh-session": "0.1.0-rc.7",
@@ -66,6 +71,7 @@
   "devDependencies": {
     "@deepseek-ai/cordis": "link:../dev/deepseek-harness/vendor/cordis",
     "@deepseek-ai/dsh-agent": "link:../dev/deepseek-harness/packages/core/agent",
+    "@deepseek-ai/dsh-commands": "link:../dev/deepseek-harness/packages/interaction/commands",
     "@deepseek-ai/dsh-jobs": "link:../dev/deepseek-harness/packages/jobs/jobs",
     "@deepseek-ai/dsh-jobs-local": "link:../dev/deepseek-harness/packages/jobs/jobs-local",
     "@deepseek-ai/dsh-llm": "link:../dev/deepseek-harness/packages/llm/llm",

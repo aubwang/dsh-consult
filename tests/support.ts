@@ -22,11 +22,19 @@ export interface FakeDelivery {
   status?: 'idle' | 'running'
 }
 
+/** One event a fake session recorded, for suites that assert on the log. */
+export interface RecordedSessionEvent {
+  type: string
+  data: unknown
+}
+
 /** A supervisor whose two delivery lanes a test can inspect. */
 export interface FakeOwner {
   agent: Agent
   injected: UserMessage[]
   followedUp: UserMessage[]
+  /** Log-only events appended through the session (commands write their lifecycle here). */
+  appended: RecordedSessionEvent[]
   /** Simulate the owner claiming human input, which refills the wake budget. */
   claimUserInput(): void
 }
@@ -66,15 +74,26 @@ export function registerOwner(
 ): { owner: FakeOwner; dispose: () => Promise<void> } {
   const injected: UserMessage[] = []
   const followedUp: UserMessage[] = []
+  const appended: RecordedSessionEvent[] = []
   const scope = ctx.plugin(() => {})
   const id = SessionId(sessionId)
+  let seq = 0
   const agent = {
     id,
     ctx: scope.ctx,
     status: delivery.status ?? 'running',
     inject: (message: UserMessage) => injected.push(message),
     followup: (message: UserMessage) => followedUp.push(message),
-    session: { id, header: { version: 0, id, createdAt: 0 } },
+    session: {
+      id,
+      header: { version: 0, id, createdAt: 0 },
+      // ctx.commands writes its own command/run and command/done lifecycle
+      // records through the session, so a fake one has to accept them.
+      append: (type: string, data: unknown) => {
+        appended.push({ type, data })
+        return { type, data, seq: (seq += 1), time: Date.now() }
+      },
+    },
   } as unknown as Agent
   const detach = ctx.agents.register(agent)
   return {
@@ -82,6 +101,7 @@ export function registerOwner(
       agent,
       injected,
       followedUp,
+      appended,
       claimUserInput: () => ctx.emit('agent/inbox/claimed', {
         agent,
         message: { source: { kind: 'user' } } as unknown as UserMessage,

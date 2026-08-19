@@ -14,6 +14,9 @@ importers:
       '@deepseek-ai/dsh-agent':
         specifier: link:../dev/deepseek-harness/packages/core/agent
         version: link:../dev/deepseek-harness/packages/core/agent
+      '@deepseek-ai/dsh-commands':
+        specifier: link:../dev/deepseek-harness/packages/interaction/commands
+        version: link:../dev/deepseek-harness/packages/interaction/commands
       '@deepseek-ai/dsh-jobs':
         specifier: link:../dev/deepseek-harness/packages/jobs/jobs
         version: link:../dev/deepseek-harness/packages/jobs/jobs
