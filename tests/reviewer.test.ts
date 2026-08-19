@@ -36,11 +36,20 @@ interface Harness {
 const teardown: Array<() => Promise<void>> = []
 const signal = new AbortController().signal
 
+/**
+ * How the composition provides background jobs:
+ * `attached` mounts a registry with a controller; `none` mounts no registry at
+ * all; `unattached` mounts one whose `start` refuses because no controller
+ * serves the owner.
+ */
+type JobsMode = 'attached' | 'none' | 'unattached'
+
 /** Mount the reviewer over the consult provider driven by the fake CLI. */
 async function setupConsult(
   scenario: Record<string, string> = {},
   provider: Partial<ProviderConfig> = {},
   reviewer: Reviewer.Config = {},
+  jobsMode: JobsMode = 'attached',
 ): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-consult-reviewer-'))
   const record = join(dir, 'record.jsonl')
@@ -50,9 +59,9 @@ async function setupConsult(
     await ctx.plugin(CommandRuntime),
     await ctx.plugin(LocalSubprocessRuntime),
     await ctx.plugin(AgentRegistry),
-    await ctx.plugin(LocalJobRegistry),
   ]
-  ctx.jobs.attachController('test')
+  if (jobsMode !== 'none') fibers.push(await ctx.plugin(LocalJobRegistry))
+  if (jobsMode === 'attached') ctx.jobs.attachController('test')
   fibers.push(await ctx.plugin(ConsultDelegation, {
     consultPath: process.execPath,
     consultArgs: [FIXTURE],
@@ -220,5 +229,62 @@ describe('/review over a provider with no review capability', () => {
     const harness = await setupToy()
     const names = harness.ctx.commands.list(harness.owner.agent).map((command) => command.name)
     assert.ok(names.includes('review'))
+  })
+})
+
+describe('collection does not depend on a job registry', () => {
+  // The reply promises that findings will arrive. Collection is what keeps
+  // that promise, so it cannot be conditional on registration succeeding.
+  it('delivers findings with no job registry mounted, and promises nothing it cannot do', async () => {
+    const harness = await setupConsult(
+      { FAKE_CONSULT_FINAL_TEXT: 'FINDING: unbounded retry loop' }, {}, {}, 'none',
+    )
+    const result = await harness.run('/review main')
+    assert.equal(result.kind, 'success')
+    assert.equal(/job_kill/.test(result.text ?? ''), false, 'no job exists, so none is offered')
+    assert.match(result.text ?? '', /not registered as a background job/)
+    const notice = await until(() => harness.owner.injected[0])
+    assert.match(bodyOf(notice as unknown as { content: Array<{ text?: string }> }), /FINDING: unbounded retry loop/)
+  })
+
+  it('delivers findings when job registration itself fails', async () => {
+    // A registry with no attached controller refuses `start`, which is the
+    // realistic shape of registration failure.
+    const harness = await setupConsult(
+      { FAKE_CONSULT_FINAL_TEXT: 'FINDING: swallowed error' }, {}, {}, 'unattached',
+    )
+    const result = await harness.run('/review main')
+    assert.equal(result.kind, 'success')
+    assert.equal(/job_kill/.test(result.text ?? ''), false)
+    const notice = await until(() => harness.owner.injected[0])
+    assert.match(bodyOf(notice as unknown as { content: Array<{ text?: string }> }), /FINDING: swallowed error/)
+  })
+})
+
+describe('findings are bounded before they enter the session', () => {
+  it('truncates an oversized review with a marker', async () => {
+    const harness = await setupConsult(
+      { FAKE_CONSULT_FINAL_TEXT: 'F'.repeat(40_000) },
+      // The provider's own budget is deliberately larger, so the reviewer's cap
+      // is the one doing the work.
+      { maxTextBytes: 32_000 },
+      { maxNoticeBytes: 512 },
+    )
+    await harness.run('/review main')
+    const notice = await until(() => harness.owner.injected[0])
+    const body = bodyOf(notice as unknown as { content: Array<{ text?: string }> })
+    assert.match(body, /more bytes not shown/)
+    assert.ok(Buffer.byteLength(body, 'utf8') < 1_500, `notice was ${Buffer.byteLength(body, 'utf8')} bytes`)
+  })
+
+  it('leaves a review that fits untouched', async () => {
+    const harness = await setupConsult(
+      { FAKE_CONSULT_FINAL_TEXT: 'FINDING: one small thing' }, {}, { maxNoticeBytes: 4_000 },
+    )
+    await harness.run('/review main')
+    const notice = await until(() => harness.owner.injected[0])
+    const body = bodyOf(notice as unknown as { content: Array<{ text?: string }> })
+    assert.match(body, /FINDING: one small thing/)
+    assert.equal(/not shown/.test(body), false)
   })
 })

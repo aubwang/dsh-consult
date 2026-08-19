@@ -135,9 +135,13 @@ export function apply(ctx: Context, config: Config = {}): void {
   /** Render a settled review into the notice body the session receives. */
   const noticeFor = (result: DelegationResult): { body: string; summary: string } => {
     if (result.status === 'completed' && result.finalText !== undefined) {
+      // The provider bounds delegate text to ITS budget; this notice has its
+      // own, and it is the one that governs what enters this session. Without
+      // this, a long review injects a message of the provider's choosing.
+      const findings = boundText(result.finalText, resolved.maxNoticeBytes, 'head')
       return {
         summary: `review ${result.id} finished with findings`,
-        body: `${frameDelegateText(result.id, 'review findings', result.finalText)}\n\n`
+        body: `${frameDelegateText(result.id, 'review findings', findings.text)}\n\n`
           + 'Review findings are a claim about the code, not a verdict on it: check each one before acting.',
       }
     }
@@ -191,28 +195,49 @@ export function apply(ctx: Context, config: Config = {}): void {
     }
   }
 
-  /** Register the review as a background job so it is listable and killable. */
-  const track = (jobId: DelegationJobId, owner: Agent, options: DelegationCallOptions): string | undefined => {
-    const jobs = ctx.get('jobs')
-    if (jobs === undefined) return undefined
+  /**
+   * Start collecting the review, registering it as a background job when one
+   * can be.
+   *
+   * Collection is what turns a queued review into findings in the session, so
+   * it must happen whether or not a job registry is mounted and whether or not
+   * registration succeeds — the reply promises delivery either way. A job adds
+   * listability and `job_kill`; it is not the thing that makes the review
+   * arrive.
+   * @returns the background job id when one was registered.
+   */
+  const startCollection = (jobId: DelegationJobId, owner: Agent, options: DelegationCallOptions): string | undefined => {
     const controller = new AbortController()
-    try {
-      return jobs.start({
-        kind: 'review',
-        label: `review ${jobId}`,
-        owner,
-        run: () => ({
-          cancel: () => {
-            controller.abort()
-            void ctx.delegation.cancel(jobId, detached(options)).catch(() => {})
-          },
-          done: collect(jobId, owner, options, controller).finally(() => controller.abort()),
-        }),
-      })
-    } catch {
-      controller.abort()
-      return undefined
+    let begun = false
+    const begin = (): Promise<JobOutcome> => {
+      begun = true
+      return collect(jobId, owner, options, controller).finally(() => controller.abort())
     }
+    const jobs = ctx.get('jobs')
+    if (jobs !== undefined) {
+      try {
+        return jobs.start({
+          kind: 'review',
+          label: `review ${jobId}`,
+          owner,
+          run: () => ({
+            cancel: () => {
+              controller.abort()
+              void ctx.delegation.cancel(jobId, detached(options)).catch(() => {})
+            },
+            done: begin(),
+          }),
+        })
+      } catch {
+        // Registration failed after the review was already queued. Fall
+        // through to untracked collection rather than abandoning it, unless
+        // the starter had already begun — then it is running.
+        if (!begun) void begin()
+        return undefined
+      }
+    }
+    void begin()
+    return undefined
   }
 
   const queue = async (invocation: CommandInvocation, base: string | undefined): Promise<Queued> => {
@@ -228,7 +253,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     const review = ctx.delegation.review?.bind(ctx.delegation)
     if (review === undefined) throw new UnsupportedReview()
     const job = await review(spec, options)
-    const backgroundJobId = track(job.id, invocation.agent, options)
+    const backgroundJobId = startCollection(job.id, invocation.agent, options)
     return { jobId: job.id, ...backgroundJobId !== undefined ? { backgroundJobId } : {} }
   }
 
@@ -261,7 +286,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         const queued = await queue(invocation, base)
         const target = base === undefined ? 'the current change' : `changes since ${base}`
         const tracked = queued.backgroundJobId === undefined
-          ? 'It is not tracked as a background job, so it cannot be listed or stopped from here.'
+          ? 'It is not registered as a background job in this composition, so it cannot be listed or stopped from here.'
           : `Tracked as background job ${queued.backgroundJobId}; stop it with job_kill ${queued.backgroundJobId}.`
         return {
           kind: 'success',
