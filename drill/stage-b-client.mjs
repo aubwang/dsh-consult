@@ -26,11 +26,13 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
+import { selectProfileRegistry } from './profiles.ts'
 
 const run = promisify(execFile)
 const HARNESS = process.env.DRILL_HARNESS ?? '/home/dev/dev/deepseek-harness'
 const COMPOSITION = path.join(import.meta.dirname, 'stage-b-acp.cordis.yml')
 const TOKEN = 'APPROACH-B'
+const PROFILE = process.env.DRILL_PROFILE ?? 'codex'
 const DEADLINE_MS = Number(process.env.DRILL_DEADLINE_MS ?? '600000')
 
 const DELEGATE_PROMPT = [
@@ -50,7 +52,7 @@ const SUPERVISOR_PROMPT = [
   'You are supervising one delegated task. Use only the delegate* tools; do not do the work yourself, and do not use bash.',
   '',
   'STEP 1. Call `delegate` now with:',
-  '- profile: "codex"',
+  `- profile: "${PROFILE}"`,
   '- mode: "write"',
   '- extensions: {"sandbox": "inherit"}',
   '- label: "naming decision"',
@@ -80,6 +82,18 @@ const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-stageb-acp-'))
 await run('git', ['init', '-q'], { cwd: workspace })
 await fs.writeFile(path.join(workspace, 'README.md'), '# stage-b acp workspace\n')
 say(`workspace: ${workspace}`)
+
+// A kept CONSULT_DATA_DIR is what makes a failed run debuggable, but a fresh
+// one has no profile registry — so seed it from the real one exactly as
+// drill/full-loop.mjs does. Without this the delegate is "Unknown profile".
+const dataDir = process.env.DRILL_CONSULT_DATA_DIR
+if (dataDir !== undefined) {
+  const sourcePath = path.join(os.homedir(), '.consult', 'profiles.json')
+  const source = JSON.parse(await fs.readFile(sourcePath, 'utf8'))
+  await fs.mkdir(dataDir, { recursive: true })
+  await fs.writeFile(path.join(dataDir, 'profiles.json'), `${JSON.stringify(selectProfileRegistry(source, PROFILE), null, 2)}\n`)
+  say(`consult data dir: ${dataDir} (seeded with the "${PROFILE}" profile)`)
+}
 
 // ── the ACP server ──────────────────────────────────────────────────────────
 const server = spawn(process.execPath, [

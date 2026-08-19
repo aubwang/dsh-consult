@@ -219,10 +219,26 @@
 # the profile the delegation will actually name.
 # DRILL_CONSULT_BIN selects the consult that serves the delegation, mirroring
 # drill/full-loop.mjs: an absolute path is a checkout entry point run through
-# node, and its absence falls back to whatever `consult` is on PATH. It matters
-# which one — reporting upward needs the report-exec carve-out, and two builds
-# can advertise `features.reportExec` while differing on whether a delegate's
-# ESCALATED retry of that command is honored.
+# node, and its absence falls back to whatever `consult` is on PATH.
+#
+# LEAVE IT UNSET FOR A REAL DELEGATE. consult's report-exec carve-out is keyed
+# on INSTALLATION IDENTITY: the binary the delegate invokes must realpath to the
+# same entry point as the consult supervising the job ("this Job's reports
+# belong to this Job's state directory"). A delegate prompted to run bare
+# `consult report` resolves it from PATH, so supervising the job with a
+# CHECKOUT while the delegate reaches the PATH install is an identity mismatch,
+# and the carve-out falls through to the ordinary denial — the delegate's exec
+# comes back `status: failed, exit_code: null` with no output and no report
+# event. Verified directly against consult's decidePermission:
+#
+#   supervising = PATH install, delegate runs `consult`  -> ALLOWED
+#   supervising = checkout,     delegate runs `consult`  -> DENIED
+#
+# A checkout is fine for the FAKE delegate (drill/full-loop.mjs), which spawns
+# the subprocess itself and never crosses the permission layer.
+#
+# DRILL_CONSULT_DATA_DIR keeps consult's state somewhere inspectable instead of
+# the user's ~/.consult, which is what makes a failed run debuggable.
 - id: consult-delegation
   name: '/home/dev/dsh-consult/lib/provider.js'
   config:
@@ -230,6 +246,7 @@
     # the `?` for a complex-key marker and the row loads an object.
     consultPath: !!js "process.env.DRILL_CONSULT_BIN === undefined ? 'consult' : process.execPath"
     consultArgs: !!js "process.env.DRILL_CONSULT_BIN === undefined ? [] : [process.env.DRILL_CONSULT_BIN]"
+    dataDir: !!js "process.env.DRILL_CONSULT_DATA_DIR"
     sandbox: inherit
     defaultProfile: codex
 
