@@ -12,6 +12,7 @@ It ships three plugin modules from one package:
 | `@aubwang/dsh-consult/provider` | Service **Provider** — `ConsultDelegation` over the real consult CLI | mounts `ctx.delegation`; injects `ctx.subprocess` |
 | `@aubwang/dsh-consult/tools` | **Consumer** — the model-facing `delegate*` tools | injects `ctx.tools`, `ctx.delegation`; uses `ctx.jobs` when present |
 | `@aubwang/dsh-consult/toy-provider` | **Second provider** — a trivial dsh-native one, kept for [seam honesty](#the-second-provider) | mounts `ctx.delegation`; injects `ctx.subprocess` |
+| `@aubwang/dsh-consult/reviewer` | **Consumer #2** — the human-triggered [`/review` command](#reviewer) | injects `ctx.commands`, `ctx.delegation`; uses `ctx.jobs` when present |
 
 The tools talk **only** to `ctx.delegation`. Nothing in `tools.ts` knows that consult exists, so a future dsh-native delegation provider drops in behind the same seam without touching the model-facing surface.
 
@@ -337,6 +338,38 @@ node drill/events-live.mjs /path/to/consult/bin/consult
 
 The same drill exercises the real `consult steer` against those records. A steer that is *accepted* needs a live broker socket behind a real running job, which a drill that fabricates records cannot create; the three refusal families — which are the ones whose exit-code mapping this plugin owns — are all reachable, and the accepted path is covered by the M5 end-to-end loop.
 
+## Reviewer
+
+`@aubwang/dsh-consult/reviewer` delegates a read-only review of the current change to a separate agent, and hands the findings back to the session that asked for them.
+
+```
+/review              # review whatever the provider calls "the current change"
+/review main         # review the changes since a base ref
+```
+
+It answers immediately with what it queued, and the findings arrive in the session when the review finishes:
+
+```
+Review of changes since main queued as job-7. Its findings will be added to this
+session when it finishes. Tracked as background job review-1; stop it with job_kill review-1.
+```
+
+**A human asks, or nothing happens.** The command is the only trigger. There is no hook, no schedule, and no reaction to a commit or a turn boundary, because each of those spends a delegate's tokens on its own initiative. Automatic review triggers are a real feature — they belong in a **policy plugin consuming the same seam**, not in the mechanism, which stays inert until a person invokes it. For the same reason findings are *injected* rather than delivered as a followup: waking an idle agent opens a model turn, and opening one to relay a result nobody is waiting for is the same autonomous spend by another route.
+
+**It is also the seam's outside check.** `tools.ts` was written alongside `ctx.delegation`, which is the position from which an interface quietly stops being one. The reviewer imports the seam's types and `ctx.delegation` and **nothing** from the consult adapter, either provider, or the delegation tools — and a test asserts that import graph, so the property survives an edit. It runs unchanged over both providers; against the toy provider, which does not implement `review` at all, `/review` answers *"serves no reviews — nothing was queued"* instead of failing. That is the optional-capability design paying off in the only way that counts.
+
+### Config
+
+| key | default | meaning |
+|---|---|---|
+| `profile` | – | reviewer identity; omitted lets the provider choose |
+| `model` | – | model id passed to the reviewer |
+| `effort` | – | reasoning effort; review is a subtle-risk turn, so raise it when the provider allows |
+| `defaultBase` | – | base ref for a bare `/review`. **Unset on purpose**: absent means the *provider* decides what "the current change" is, and pinning a ref here would encode one provider's VCS semantics into a consumer that is not supposed to know them |
+| `maxNoticeBytes` | `16000` | byte cap for the findings notice |
+
+Findings are framed as untrusted delegate data like every other delegate-authored text in this package, and closed with a reminder that a review is a claim about the code rather than a verdict on it.
+
 ## The second provider
 
 `@aubwang/dsh-consult/toy-provider` is a deliberately trivial second implementation of `ctx.delegation`: a delegation is one short-lived subprocess spawned through `ctx.subprocess`, and everything else is an in-memory record. It is a test double with a real service shell, not a product.
@@ -451,7 +484,9 @@ The fake delegate never asks its client for permission, so **fake mode does not 
 - **Preflight answers for one authority.** Doctor checks a single authority, so preflight asks about the deployment's configured `defaultMode`/`sandbox`. A per-call `mode` or `sandbox` that differs from the configured default is not preflighted; consult still enforces it at delegate time, and a rejected combination surfaces there rather than as `not-ready`.
 - **The full-loop drill needs unix sockets.** consult's background worker talks to a job-scoped broker over one, so a sandbox that denies `listen(2)` leaves delegations silently `queued`. Unit and integration tests are unaffected — they never reach the broker.
 - **Preflight runs `consult doctor`, which really launches the profile.** It stages a credential and initializes/disposes the agent (it sends no model prompt). That is a real cost on first use; it is memoized until it fails.
-- **One package, three modules.** The seam is real from day one, but it is not yet its own npm package. It graduates to a standalone Definition package when a second provider appears — the `./seam` subpath export exists so that move does not break consumers.
+- **The reviewer has no automatic trigger.** `/review` must be typed. Reviewing on a commit, on a turn boundary, or on a schedule is deliberately absent — it spends a delegate's tokens without a human asking, so it belongs in a policy plugin over the same seam rather than in this mechanism.
+- **Review findings are injected, not woken.** A review that finishes while its session is idle waits for the next step rather than opening a turn to announce itself. That is the right default for an unattended host and the wrong one for a human sitting at a prompt; a deployment that wants the other behavior needs the policy plugin above.
+- **One package, four modules.** The seam is real from day one, but it is not yet its own npm package. It graduates to a standalone Definition package when a second provider appears — the `./seam` subpath export exists so that move does not break consumers.
 
 ## License
 
