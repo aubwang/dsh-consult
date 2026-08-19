@@ -122,6 +122,16 @@ describe('preflight', () => {
     assert.deepEqual(of(harness, 'doctor')[0]?.argv, ['doctor', '--json', '--write', '--sandbox', 'inherit'])
   })
 
+  it('asks doctor about the profile this deployment names', async () => {
+    // Doctor selects a profile exactly as a delegation does. Probing without
+    // the configured one asks whether a profile nobody selected can launch,
+    // which reports "no profile selected" for a composition that delegates
+    // fine — and invites a supervisor to go set a global default instead.
+    const harness = await setup({}, { defaultProfile: 'codex' })
+    await harness.delegation.capabilities()
+    assert.deepEqual(of(harness, 'doctor')[0]?.argv, ['doctor', '--json', '--agent', 'codex', '--read-only', '--sandbox', 'confined'])
+  })
+
   it('defaults the doctor probe to read-only confined, matching the config defaults', async () => {
     const harness = await setup()
     await harness.delegation.capabilities()
