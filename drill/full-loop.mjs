@@ -248,7 +248,7 @@ try {
       check(
         features.reportExec === true,
         'this consult has no report-exec carve-out (features.reportExec), so a real delegate cannot run `consult report`. '
-        + 'Point DRILL_CONSULT_BIN at a build that has it.',
+        + 'It released in consult 1.3.0 — upgrade, or point DRILL_CONSULT_BIN at a build that has it.',
       )
     }
   }

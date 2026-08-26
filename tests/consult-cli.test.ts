@@ -24,6 +24,8 @@ import {
   projectEvent,
   projectJob,
   projectResult,
+  parseCapabilitiesReport,
+  checkCapabilityContracts,
   reviewArgs,
   steerArgs,
   type ConsultRun,
@@ -296,11 +298,69 @@ describe('argv construction', () => {
 
   it('builds a review against a base ref or a prior job, never both', () => {
     assert.deepEqual(reviewArgs({ base: 'main' }, { sandbox: 'confined', profile: undefined }),
-      ['review', '--background', '--json', '--base', 'main', '--sandbox', 'confined'])
+      ['review', '--json', '--base', 'main', '--sandbox', 'confined'])
     assert.deepEqual(reviewArgs({ jobId: 'job-3', profile: 'codex' }, { sandbox: 'confined', profile: undefined }),
-      ['review', '--background', '--json', '--agent', 'codex', '--job', 'job-3', '--sandbox', 'confined'])
+      ['review', '--json', '--agent', 'codex', '--job', 'job-3', '--sandbox', 'confined'])
     assert.throws(() => reviewArgs({ base: 'main', jobId: 'job-3' }, { sandbox: 'confined', profile: undefined }),
       (error: unknown) => error instanceof DelegationError && error.code === 'unsupported')
+  })
+
+  it('never asks a review to run in the background', () => {
+    // consult has no queued review: `review` runs inline and rejects
+    // `--background` as an unsupported flag, so every argv this builds would
+    // have exited 2 before the reviewer was ever launched.
+    for (const spec of [{ base: 'main' }, { jobId: 'job-3' }, { label: 'l', model: 'm', effort: 'high' }]) {
+      assert.ok(!reviewArgs(spec, { sandbox: 'confined', profile: 'claude' }).includes('--background'))
+    }
+  })
+})
+
+describe('the capabilities report', () => {
+  const report = {
+    schemaVersion: 1,
+    version: '1.3.0',
+    contracts: { jobResult: 1, events: 1, profiles: 1 },
+    features: { report: true, events: true, steer: true, reportExec: true, nativeReviewProfiles: ['codex'] },
+    bounds: { reportMessageBytes: 4096, reportDataBytes: 16384, reportsPerJob: 256, steerGuidanceBytes: 16384 },
+  }
+
+  it('reads the features, contracts, and bounds a build declares', () => {
+    const parsed = parseCapabilitiesReport(JSON.stringify(report))
+    assert.deepEqual(parsed, {
+      version: '1.3.0',
+      contracts: { jobResult: 1, events: 1 },
+      features: { events: true, steer: true, reportExec: true, nativeReviewProfiles: ['codex'] },
+      bounds: { steerGuidanceBytes: 16384 },
+    })
+  })
+
+  it('treats a missing feature as absent rather than assuming it', () => {
+    const parsed = parseCapabilitiesReport(JSON.stringify({ ...report, features: { events: true } }))
+    assert.deepEqual(parsed?.features, { events: true, steer: false, reportExec: false, nativeReviewProfiles: [] })
+  })
+
+  it('declines an unreadable report instead of throwing, so the caller can fall back', () => {
+    assert.equal(parseCapabilitiesReport('not json'), undefined)
+    assert.equal(parseCapabilitiesReport('[]'), undefined)
+    assert.equal(parseCapabilitiesReport(JSON.stringify({ ...report, schemaVersion: 2 })), undefined)
+    assert.equal(parseCapabilitiesReport(JSON.stringify({ schemaVersion: 1 })), undefined)
+  })
+
+  it('accepts a build whose contracts this plugin reads', () => {
+    assert.equal(checkCapabilityContracts(parseCapabilitiesReport(JSON.stringify(report))!), undefined)
+  })
+
+  it('refuses a build whose envelopes this plugin cannot read', () => {
+    const future = parseCapabilitiesReport(JSON.stringify({ ...report, contracts: { jobResult: 2, events: 1 } }))!
+    const reason = checkCapabilityContracts(future)
+    assert.match(reason ?? '', /job result schema 2/)
+    const events = parseCapabilitiesReport(JSON.stringify({ ...report, contracts: { jobResult: 1, events: 7 } }))!
+    assert.match(checkCapabilityContracts(events) ?? '', /events schema 7/)
+  })
+
+  it('says nothing about a contract the build does not state', () => {
+    const partial = parseCapabilitiesReport(JSON.stringify({ ...report, contracts: {} }))!
+    assert.equal(checkCapabilityContracts(partial), undefined)
   })
 })
 

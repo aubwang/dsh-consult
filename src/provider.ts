@@ -16,11 +16,13 @@ import type { SubprocessHandle } from '@deepseek-ai/dsh-subprocess'
 import { boundLines } from './bounds.ts'
 import {
   buildConsultEnv,
+  checkCapabilityContracts,
   countActiveDelegations,
   delegateArgs,
   eventsArgs,
   gateConsultVersion,
   mapExit,
+  parseCapabilitiesReport,
   parseDoctorReport,
   parseEventLine,
   parseEventsEnvelope,
@@ -36,6 +38,7 @@ import {
   type ConsultSandbox,
   mapSteerExit,
   MAX_STEER_GUIDANCE_BYTES,
+  type ConsultCapabilitiesReport,
   type ConsultInvocation,
   type ConsultSpawn,
 } from './consult-cli.ts'
@@ -89,6 +92,11 @@ export interface Config {
   /** Bound for one seam `wait` before it reports `timeout`; background collection re-waits. */
   waitTimeoutMs?: number
   /**
+   * Bound for one `review`. consult reviews in the foreground, so this caps how
+   * long the call itself may run rather than how long a queued job may take.
+   */
+  reviewTimeoutMs?: number
+  /**
    * How long a FAILED preflight is cached before the next call re-probes.
    * Preflight really launches the configured profile, so a model retrying
    * `delegate` in a loop against a broken install would otherwise pay that cost
@@ -134,6 +142,14 @@ interface PreflightState {
   canReport: boolean
   /** Whether the configured consult exposes the `steer` command. */
   canSteer: boolean
+  /**
+   * The build's own steer bound, when it declares one; otherwise this plugin's
+   * constant applies. `capabilities` also reports the report-exec carve-out and
+   * the native-review roster, which nothing here consumes yet and which are
+   * therefore not carried: reporting needs `sandbox: 'inherit'` to matter at
+   * all, and review falls back to consult's portable path either way.
+   */
+  steerGuidanceBytes?: number
   /** Delegations already active in this workspace when this preflight succeeded. */
   activeFromEarlierSessions: number
   diagnosis?: string
@@ -191,6 +207,7 @@ export class ConsultDelegation extends DelegationService {
     maxTextBytes: z.number().min(256).default(16_000),
     logTailLines: z.number().min(1).default(40),
     waitTimeoutMs: z.number().min(1_000).default(1_500_000),
+    reviewTimeoutMs: z.number().min(1_000).default(1_500_000),
     preflightRetryMs: z.number().min(0).default(30_000),
     eventFollowRestartMs: z.number().min(100).default(2_000),
     graceMs: z.number().min(1).default(5_000),
@@ -370,19 +387,43 @@ export class ConsultDelegation extends DelegationService {
       return { ready: false, usable: true, version: gate.version, profiles: [], canReport: false, canSteer: false, activeFromEarlierSessions: 0, diagnosis: 'could not run `consult doctor --json`' }
     }
     const doctor = parseDoctorReport(doctorRun.stdout, doctorRun.stderr)
-    const roster = await this.probeProfiles(invocation)
-    const [canReport, canSteer] = await Promise.all([
-      this.probeCommand(invocation, 'events'),
-      this.probeCommand(invocation, 'steer'),
+    const [roster, declared] = await Promise.all([
+      this.probeProfiles(invocation),
+      this.probeCapabilities(invocation),
     ])
+    // The build's own report, when it has one, answers every optional-command
+    // question in a single process. Only a pre-1.2 consult still needs the
+    // `--help` probes, which cost one process per command and cannot see a
+    // permission carve-out or a contract version at all.
+    const features = declared === undefined
+      ? await this.probeOptionalCommands(invocation)
+      : {
+        canReport: declared.features.events,
+        canSteer: declared.features.steer,
+        ...declared.bounds.steerGuidanceBytes !== undefined ? { steerGuidanceBytes: declared.bounds.steerGuidanceBytes } : {},
+      }
+    // An unreadable envelope is a fact about the whole install, so it is worth
+    // one refusal here rather than an `internal` throw from whichever call
+    // happened to parse first.
+    const incompatible = declared === undefined ? undefined : checkCapabilityContracts(declared)
+    if (incompatible !== undefined) {
+      return {
+        ready: false,
+        usable: false,
+        version: gate.version,
+        profiles: roster.profiles,
+        ...features,
+        activeFromEarlierSessions: 0,
+        diagnosis: incompatible,
+      }
+    }
     if (!doctor.canDelegate) {
       return {
         ready: false,
         usable: true,
         version: gate.version,
         profiles: roster.profiles,
-        canReport,
-        canSteer,
+        ...features,
         activeFromEarlierSessions: 0,
         ...roster.defaultProfile !== undefined ? { defaultProfile: roster.defaultProfile } : {},
         diagnosis: `consult cannot delegate right now — ${doctor.diagnosis ?? 'no diagnosis reported'}. `
@@ -395,8 +436,7 @@ export class ConsultDelegation extends DelegationService {
       usable: true,
       version: gate.version,
       profiles: roster.profiles,
-      canReport,
-      canSteer,
+      ...features,
       activeFromEarlierSessions: await this.reconcile(invocation),
       ...defaultProfile !== undefined ? { defaultProfile } : {},
     }
@@ -442,18 +482,48 @@ export class ConsultDelegation extends DelegationService {
   }
 
   /**
-   * Decide whether this consult exposes one optional command.
+   * Ask the build what it supports (consult 1.2.0+).
+   *
+   * `capabilities` is a static self-description: it resolves no workspace and
+   * reads no job or profile state, so it costs one process and answers what
+   * three `--help` probes could only infer — plus the contract versions and
+   * bounds no probe can see at all. A build without the command exits 2, which
+   * is not an error here: it is the answer, and the caller falls back.
+   * @param invocation - the resolved executable, directory, environment, and budgets.
+   * @returns the parsed report, or undefined when this build does not serve one.
+   */
+  private async probeCapabilities(invocation: ConsultInvocation): Promise<ConsultCapabilitiesReport | undefined> {
+    const run = await runConsult(this.spawn, ['capabilities', '--json'], invocation).catch(() => undefined)
+    if (run === undefined || run.exitCode !== 0) return undefined
+    return parseCapabilitiesReport(run.stdout)
+  }
+
+  /**
+   * Infer the optional commands on a consult with no `capabilities` (pre-1.2.0).
    *
    * The probe is the command's own `--help`: it exits 0 when the command exists
    * and 2 when the subcommand is unknown, which is exactly the distinction
    * being made. It touches no job, no workspace state, and no profile — unlike
-   * `doctor`, running it costs nothing but a process. Version numbers cannot
-   * answer this question: `report`/`events` and `steer` all landed after 1.0.0
-   * was cut, so two builds both reporting 1.0.0 differ on them.
+   * `doctor`, running it costs nothing but a process. Version numbers could not
+   * answer this for these builds: `report`/`events` and `steer` landed after
+   * 1.0.0 was cut and before 1.2.0 tagged them, so two builds both reporting
+   * 1.0.0 differ on them.
+   *
+   * What it cannot see is why `capabilities` exists: the report-exec carve-out
+   * is a permission decision with no command of its own, and a contract version
+   * is not a command at all. Both stay unknown on these builds.
    * @param invocation - the resolved executable, directory, environment, and budgets.
-   * @param command - the consult subcommand to probe for.
-   * @returns whether the command exists.
+   * @returns which optional commands this build exposes.
    */
+  private async probeOptionalCommands(invocation: ConsultInvocation): Promise<{ canReport: boolean; canSteer: boolean }> {
+    const [canReport, canSteer] = await Promise.all([
+      this.probeCommand(invocation, 'events'),
+      this.probeCommand(invocation, 'steer'),
+    ])
+    return { canReport, canSteer }
+  }
+
+  /** One `<command> --help` probe: exit 0 means the subcommand exists, 2 means it does not. */
   private async probeCommand(invocation: ConsultInvocation, command: string): Promise<boolean> {
     const run = await runConsult(this.spawn, [command, '--help'], invocation).catch(() => undefined)
     return run?.exitCode === 0
@@ -525,10 +595,35 @@ export class ConsultDelegation extends DelegationService {
     return projectJob(parseJobEnvelope(run.stdout))
   }
 
+  /**
+   * Run one pinned review and return the job it finalized.
+   *
+   * This is the one place the provider cannot honor the seam's "return as soon
+   * as the job record exists". consult has no queued review: `review` runs the
+   * turn inline in the process this spawns and prints the finished envelope,
+   * and it rejects `--background` outright. Faking a queued return would mean
+   * spawning the review unawaited and then guessing which new job record is
+   * ours — consult labels are explicitly non-unique, so that guess is exactly
+   * the invented data this plugin refuses to hand a supervisor elsewhere.
+   *
+   * So the call blocks for the review's own duration, bounded by
+   * `reviewTimeoutMs`, and the returned job is already terminal. Its record
+   * persists in the workspace either way, so `status`, `result`, and `logs`
+   * all answer for it by id afterwards. Consumers must read the returned
+   * status rather than assume it is queued.
+   * @param spec - review target and delegate identity.
+   * @param options - per-call host session, workspace, and cancellation.
+   * @returns the finalized job projection.
+   */
   override async review(spec: ReviewSpec, options?: DelegationCallOptions): Promise<DelegationJob> {
     await this.ensureReady(options)
     const args = reviewArgs(spec, { sandbox: this.config.sandbox, profile: this.config.defaultProfile })
-    const run = await runConsultWithRetry(this.spawn, args, await this.invocation(options))
+    const deadline = AbortSignal.timeout(this.config.reviewTimeoutMs)
+    const signal = options?.signal === undefined ? deadline : AbortSignal.any([options.signal, deadline])
+    const run = await runConsultWithRetry(this.spawn, args, await this.invocation(options, signal))
+    if (run.exitCode !== 0 && deadline.aborted) {
+      throw new DelegationError('timeout', `the review did not finish within ${this.config.reviewTimeoutMs}ms and was stopped`)
+    }
     const error = mapExit(run, { command: 'review' })
     if (error !== undefined) throw error
     return projectJob(parseJobEnvelope(run.stdout))
@@ -592,13 +687,6 @@ export class ConsultDelegation extends DelegationService {
   }
 
   override async steer(id: DelegationJobId, guidance: string, options?: DelegationCallOptions): Promise<SteerOutcome> {
-    // Rejected, never trimmed: a clipped instruction changes what the
-    // delegation is being told to do. Checked before spawning so an oversized
-    // guidance fails as the argument error it is.
-    const bytes = Buffer.byteLength(guidance, 'utf8')
-    if (bytes > MAX_STEER_GUIDANCE_BYTES) {
-      throw new Error(`guidance is ${bytes} bytes; the limit is ${MAX_STEER_GUIDANCE_BYTES}. Shorten it — consult rejects oversized guidance rather than trimming it.`)
-    }
     if (guidance.trim().length === 0) throw new Error('guidance must be a non-empty string')
     // Steering an existing delegation is observation-grade, like reading its
     // events: it needs a usable binary with the command, not the ability to
@@ -610,6 +698,17 @@ export class ConsultDelegation extends DelegationService {
       })
     }
     if (!state.canSteer) return { supported: false, reason: STEER_UNSUPPORTED }
+    // Rejected, never trimmed: a clipped instruction changes what the
+    // delegation is being told to do. The bound is the installed build's own
+    // when it declares one, so a consult that moves it is not second-guessed
+    // by a number compiled in here; the constant is the pre-1.2 fallback.
+    // Checked before spawning the steer, so an oversized guidance fails as the
+    // argument error it is rather than as a process exit.
+    const limit = state.steerGuidanceBytes ?? MAX_STEER_GUIDANCE_BYTES
+    const bytes = Buffer.byteLength(guidance, 'utf8')
+    if (bytes > limit) {
+      throw new Error(`guidance is ${bytes} bytes; the limit is ${limit}. Shorten it — consult rejects oversized guidance rather than trimming it.`)
+    }
     // Deliberately NOT runConsultWithRetry: exit 3 means a steer is already in
     // flight, and delivering a second interruption of the same turn is worse
     // than reporting that this one did not land.

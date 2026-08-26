@@ -23,6 +23,8 @@
  *   FAKE_CONSULT_DELAY_MS       sleep before answering (slow exit for wait)
  *   FAKE_CONSULT_LOG_LINES      lines the transcript starts with               (default 3)
  *   FAKE_CONSULT_LOG_GROW       lines the transcript gains per `logs` call     (default 0)
+ *   FAKE_CONSULT_NO_CAPABILITIES '1' removes the `capabilities` command (a pre-1.2.0 build)
+ *   FAKE_CONSULT_CAPABILITIES   JSON body served by `capabilities --json` (default: a 1.3.0 build)
  *   FAKE_CONSULT_NO_EVENTS      '1' removes the `events` command (a pre-report consult build)
  *   FAKE_CONSULT_NO_STEER       '1' removes the `steer` command (a pre-steer consult build)
  *   FAKE_CONSULT_NO_BROKERS     '1' removes the `brokers` command (an old consult build)
@@ -44,7 +46,41 @@ import { appendFileSync, readFileSync, renameSync, writeFileSync } from 'node:fs
 const argv = process.argv.slice(2)
 const command = argv[0] ?? ''
 
+/**
+ * What each subcommand of the REAL consult accepts, copied from its own
+ * `unsupportedFlagError` allowlists.
+ *
+ * This is the point of the fixture. A stand-in that answers every argv is a
+ * stand-in that cannot fail when the plugin builds argv the CLI rejects — which
+ * is exactly how `review --background` survived: consult has never accepted it,
+ * and a fake that ignored flags reported a queued review anyway. Keep these in
+ * step with consult's own lists; a flag missing here must fail a test, not pass
+ * one.
+ */
+const SUPPORTED_FLAGS = {
+  delegate: ['agent', 'profile', 'model', 'effort', 'host', 'host-session', 'host-session-id',
+    'parent-job', 'parent-job-id', 'resume-job', 'prompt', 'prompt-file', 'base', 'sandbox',
+    'after', 'label', 'write', 'read-only', 'resume', 'fresh', 'background', 'wait',
+    'include-diff', 'isolated', 'allow-fetch', 'allow-exec', 'json'],
+  // No `background`: consult reviews inline, in the invoking process.
+  review: ['agent', 'profile', 'host', 'host-session', 'host-session-id', 'base', 'sandbox',
+    'json', 'job', 'label', 'model', 'effort'],
+  status: ['follow', 'wait', 'json', 'all', 'tail'],
+  wait: ['json', 'summary', 'keep-running'],
+  result: ['json'],
+  logs: ['follow', 'json', 'tail', 'all'],
+  cancel: [],
+  steer: ['message'],
+  events: ['follow', 'json', 'since', 'type'],
+  brokers: ['cleanup', 'json'],
+  agents: ['set', 'host', 'json'],
+  doctor: ['agent', 'profile', 'host', 'host-session', 'host-session-id', 'read-only', 'write',
+    'isolated', 'sandbox', 'allow-fetch', 'allow-exec', 'json'],
+  capabilities: ['json'],
+}
+
 record()
+rejectUnsupportedFlags()
 
 const counter = bumpCounter(command)
 const forced = forcedExit(command, counter)
@@ -67,10 +103,20 @@ switch (command) {
     ])}\n`)
     exit(0)
     break
+  case 'capabilities':
+    capabilities()
+    break
   case 'delegate':
+    if (forced !== undefined) exitWith(forced, forced === 2 ? usageOrMissing('delegate: bad flag\n') : 'delegate failed\n')
+    out(`${JSON.stringify(envelope({ status: 'queued', kind: 'delegate' }))}\n`)
+    exit(0)
+    break
   case 'review':
-    if (forced !== undefined) exitWith(forced, forced === 2 ? usageOrMissing(`${command}: bad flag\n`) : `${command} failed\n`)
-    out(`${JSON.stringify(envelope({ status: 'queued', kind: command }))}\n`)
+    // consult runs a review inline and prints the FINISHED envelope; there is
+    // no queued review to return.
+    if (forced !== undefined) exitWith(forced, forced === 2 ? usageOrMissing('review: bad flag\n') : 'review failed\n')
+    await sleep()
+    out(`${JSON.stringify(envelope({ status: process.env.FAKE_CONSULT_STATUS ?? 'completed', kind: 'review' }))}\n`)
     exit(0)
     break
   case 'status':
@@ -111,6 +157,51 @@ switch (command) {
     break
   default:
     exitWith(2, `unknown subcommand: ${command}\n`)
+}
+
+function rejectUnsupportedFlags() {
+  const supported = SUPPORTED_FLAGS[command]
+  if (supported === undefined) return
+  // `--help` is answered before flag validation by the real CLI too.
+  if (argv.includes('--help')) return
+  for (const arg of argv.slice(1)) {
+    if (arg === '--') break
+    if (!arg.startsWith('--')) continue
+    const name = arg.slice(2).split('=')[0]
+    if (!supported.includes(name)) {
+      exitWith(2, `unsupported flag: --${name}\n`)
+    }
+  }
+}
+
+function capabilities() {
+  // Builds before 1.2.0 have no such command; the plugin reads that exit as the
+  // answer and falls back to the `--help` probes.
+  if (process.env.FAKE_CONSULT_NO_CAPABILITIES === '1') exitWith(2, 'unknown subcommand: capabilities\n')
+  const override = process.env.FAKE_CONSULT_CAPABILITIES
+  if (override !== undefined) {
+    out(`${override}\n`)
+    exit(0)
+  }
+  out(`${JSON.stringify({
+    schemaVersion: 1,
+    version: process.env.FAKE_CONSULT_VERSION ?? '1.3.0',
+    contracts: { jobResult: 1, events: 1, profiles: 1 },
+    features: {
+      report: process.env.FAKE_CONSULT_NO_EVENTS !== '1',
+      events: process.env.FAKE_CONSULT_NO_EVENTS !== '1',
+      steer: process.env.FAKE_CONSULT_NO_STEER !== '1',
+      reportExec: true,
+      nativeReviewProfiles: ['codex'],
+    },
+    bounds: {
+      reportMessageBytes: 4096,
+      reportDataBytes: 16384,
+      reportsPerJob: 256,
+      steerGuidanceBytes: 16384,
+    },
+  })}\n`)
+  exit(0)
 }
 
 function defaultEvents() {

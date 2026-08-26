@@ -350,7 +350,9 @@ declare module '@deepseek-ai/cordis' {
  * Implementations must honor these semantics:
  * - Every delegation is BACKGROUND. {@link delegate} and {@link review} return
  *   as soon as the job record exists; collection happens through
- *   {@link wait}/{@link result} or the host's own job runtime.
+ *   {@link wait}/{@link result} or the host's own job runtime. The one
+ *   exception is a {@link review} whose backend has no queued review at all —
+ *   see that method.
  * - Domain failures throw {@link DelegationError}; only a broken provider
  *   install or a violated contract throws anything else. A provider never
  *   crashes the plugin because the delegate had a bad day.
@@ -385,15 +387,23 @@ export abstract class DelegationService extends Service {
   abstract delegate(spec: DelegateSpec, options?: DelegationCallOptions): Promise<DelegationJob>
 
   /**
-   * Queue one pinned read-only review turn and return immediately.
+   * Run one pinned read-only review and return its job.
    *
    * OPTIONAL. Reviewing means pinning a VCS change, which a provider without a
    * checkout cannot do; such a provider omits the method entirely and reports
    * {@link DelegationCapabilities.canReview} as false. A consumer checks for
    * the method (or the capability) and reports the absence as a domain outcome.
+   *
+   * A provider whose backend queues reviews returns as soon as the job record
+   * exists, like {@link delegate}. A provider whose backend only reviews in the
+   * foreground — consult is one — blocks for the review's duration and returns
+   * a job that is ALREADY TERMINAL. Both are conforming, so a consumer must
+   * read {@link DelegationJob.status} on the returned job rather than assume it
+   * is queued: tracking a finished job as if it were live announces work that
+   * already happened.
    * @param spec - review target and delegate identity.
    * @param options - per-call host session, workspace, and cancellation.
-   * @returns the queued job projection.
+   * @returns the job projection, queued or terminal depending on the provider.
    */
   review?(spec: ReviewSpec, options?: DelegationCallOptions): Promise<DelegationJob>
 

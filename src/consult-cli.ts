@@ -243,6 +243,97 @@ export function parseDoctorReport(stdout: string, stderr: string): DoctorSummary
   }
 }
 
+/**
+ * The only `consult capabilities` schema version this plugin reads. A different
+ * one degrades to the `--help` probes rather than being half-parsed: the report
+ * exists to answer a question the probes can still answer more slowly.
+ */
+export const SUPPORTED_CAPABILITIES_SCHEMA_VERSION = 1
+
+/** The subset of `consult capabilities --json` this plugin depends on. */
+export interface ConsultCapabilitiesReport {
+  version: string
+  /** Schema version of each machine-readable envelope this plugin parses. */
+  contracts: { jobResult?: number; events?: number }
+  features: {
+    events: boolean
+    steer: boolean
+    /** Whether this build approves a delegate running `consult report` on itself. */
+    reportExec: boolean
+    /** Profiles whose installed shim advertises a native review command. */
+    nativeReviewProfiles: string[]
+  }
+  /** Limits the commands enforce, so a caller can size a payload before sending it. */
+  bounds: { steerGuidanceBytes?: number }
+}
+
+/**
+ * Parse `consult capabilities --json` (consult 1.2.0+).
+ *
+ * This is the build's own answer to what it supports, and it replaces running
+ * three `<command> --help` probes to infer the same thing. Unlike a job
+ * envelope, an unreadable report is never fatal: it returns undefined and the
+ * caller falls back to the probes, because a plugin that refuses to start over
+ * a self-description it could not read is worse than one that asks the slow way.
+ * @param stdout - the CLI's `--json` output.
+ * @returns the report, or undefined when this output is not one this plugin reads.
+ */
+export function parseCapabilitiesReport(stdout: string): ConsultCapabilitiesReport | undefined {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(stdout.trim())
+  } catch {
+    return undefined
+  }
+  if (!isRecord(parsed)) return undefined
+  if (parsed.schemaVersion !== SUPPORTED_CAPABILITIES_SCHEMA_VERSION) return undefined
+  const version = stringOf(parsed.version)
+  if (version === undefined) return undefined
+  const features = isRecord(parsed.features) ? parsed.features : {}
+  const contracts = isRecord(parsed.contracts) ? parsed.contracts : {}
+  const bounds = isRecord(parsed.bounds) ? parsed.bounds : {}
+  return {
+    version,
+    contracts: {
+      ...numberOf(contracts.jobResult) !== undefined ? { jobResult: numberOf(contracts.jobResult) } : {},
+      ...numberOf(contracts.events) !== undefined ? { events: numberOf(contracts.events) } : {},
+    },
+    features: {
+      events: features.events === true,
+      steer: features.steer === true,
+      reportExec: features.reportExec === true,
+      nativeReviewProfiles: Array.isArray(features.nativeReviewProfiles)
+        ? features.nativeReviewProfiles.filter((entry): entry is string => typeof entry === 'string')
+        : [],
+    },
+    bounds: {
+      ...numberOf(bounds.steerGuidanceBytes) !== undefined ? { steerGuidanceBytes: numberOf(bounds.steerGuidanceBytes) } : {},
+    },
+  }
+}
+
+/**
+ * Refuse a build whose machine-readable contracts this plugin cannot read.
+ *
+ * `capabilities` states these up front, so an incompatible envelope becomes one
+ * actionable preflight diagnosis instead of an `internal` throw on whatever
+ * call happened to parse first.
+ * @param report - a parsed capabilities report.
+ * @returns the refusal reason, or undefined when both contracts are readable.
+ */
+export function checkCapabilityContracts(report: ConsultCapabilitiesReport): string | undefined {
+  const mismatches: string[] = []
+  if (report.contracts.jobResult !== undefined && report.contracts.jobResult !== SUPPORTED_SCHEMA_VERSION) {
+    mismatches.push(`job result schema ${report.contracts.jobResult} (this plugin reads ${SUPPORTED_SCHEMA_VERSION})`)
+  }
+  if (report.contracts.events !== undefined && report.contracts.events !== SUPPORTED_EVENTS_SCHEMA_VERSION) {
+    mismatches.push(`events schema ${report.contracts.events} (this plugin reads ${SUPPORTED_EVENTS_SCHEMA_VERSION})`)
+  }
+  if (mismatches.length === 0) return undefined
+  return `consult ${report.version} emits ${mismatches.join(' and ')}. `
+    + 'Upgrade this plugin, or point `consultPath` at a consult whose contracts it reads.'
+}
+
 /** The schema-version-1 job payload sections this plugin reads. */
 export interface JobEnvelope {
   job: Record<string, unknown>
@@ -410,7 +501,16 @@ export function delegateArgs(spec: DelegateSpec, defaults: { mode: DelegationMod
   return args
 }
 
-/** Build `consult review` arguments from a seam spec. Always background, always `--json`. */
+/**
+ * Build `consult review` arguments from a seam spec. Always `--json`, and
+ * deliberately NOT `--background`.
+ *
+ * consult has no queued review: `review` runs its turn inline in the invoking
+ * process (`runner: "inline"`) and prints the finished envelope, and it rejects
+ * `--background` as an unsupported flag (exit 2). The seam's "return as soon as
+ * the job record exists" therefore cannot be honored for a review here — see
+ * {@link ConsultDelegation.review}, which owns that deviation and bounds it.
+ */
 export function reviewArgs(spec: ReviewSpec, defaults: { sandbox: ConsultSandbox; profile?: string | undefined }): string[] {
   if (spec.base !== undefined && spec.jobId !== undefined) {
     throw new DelegationError('unsupported', 'review accepts either a base ref or a job id, not both')
@@ -419,7 +519,7 @@ export function reviewArgs(spec: ReviewSpec, defaults: { sandbox: ConsultSandbox
   if (extensions.isolated !== undefined) {
     throw new DelegationError('unsupported', 'the "isolated" extension does not apply to a review; reviews are always read-only')
   }
-  const args = ['review', '--background', '--json']
+  const args = ['review', '--json']
   const profile = spec.profile ?? defaults.profile
   if (profile !== undefined) args.push('--agent', profile)
   if (spec.base !== undefined) args.push('--base', spec.base)
@@ -801,6 +901,10 @@ function internalError(message: string): DelegationError {
 
 function stringOf(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+function numberOf(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) ? value : undefined
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

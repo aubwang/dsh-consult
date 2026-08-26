@@ -223,6 +223,85 @@ describe('delegate and review', () => {
     await assert.rejects(harness.delegation.review({ base: 'main' }), (error: unknown) =>
       error instanceof DelegationError && error.code === 'review-unsupported')
   })
+
+  it('reviews in the foreground and returns a job that already finished', async () => {
+    // consult has no queued review. The fixture rejects `--background` exactly
+    // as consult does, so an argv that asked for one would fail here rather
+    // than quietly reporting a queued review that was never queued.
+    const harness = await setup()
+    const job = await harness.delegation.review({ base: 'main', profile: 'codex' })
+    assert.equal(job.status, 'completed')
+    assert.equal(job.kind, 'review')
+    const argv = of(harness, 'review')[0]?.argv ?? []
+    assert.ok(!argv.includes('--background'), 'consult rejects --background on review')
+    assert.ok(argv.includes('--json'))
+  })
+
+  it('bounds a review that never finishes', async () => {
+    const harness = await setup({ FAKE_CONSULT_DELAY_MS: '5000' }, { reviewTimeoutMs: 1_000 })
+    await assert.rejects(harness.delegation.review({ base: 'main' }), (error: unknown) =>
+      error instanceof DelegationError && error.code === 'timeout')
+  })
+})
+
+describe('the capabilities probe', () => {
+  it('takes the optional commands from the build\'s own report', async () => {
+    const harness = await setup()
+    const capabilities = await harness.delegation.capabilities()
+    assert.equal(capabilities.canReport, true)
+    assert.equal(capabilities.canSteer, true)
+    // One `capabilities` call answers what the per-command probes asked for.
+    assert.equal(of(harness, 'capabilities').length, 1)
+    assert.equal(of(harness, 'events').filter((run) => run.argv.includes('--help')).length, 0)
+    assert.equal(of(harness, 'steer').filter((run) => run.argv.includes('--help')).length, 0)
+  })
+
+  it('falls back to the --help probes on a build with no capabilities command', async () => {
+    const harness = await setup({ FAKE_CONSULT_NO_CAPABILITIES: '1' })
+    const capabilities = await harness.delegation.capabilities()
+    assert.equal(capabilities.canReport, true)
+    assert.equal(capabilities.canSteer, true)
+    assert.equal(of(harness, 'events').filter((run) => run.argv.includes('--help')).length, 1)
+    assert.equal(of(harness, 'steer').filter((run) => run.argv.includes('--help')).length, 1)
+  })
+
+  it('believes the report over the presence of a command', async () => {
+    const declared = JSON.stringify({
+      schemaVersion: 1,
+      version: '1.3.0',
+      contracts: { jobResult: 1, events: 1, profiles: 1 },
+      features: { report: false, events: false, steer: false, reportExec: false, nativeReviewProfiles: [] },
+      bounds: { steerGuidanceBytes: 16384 },
+    })
+    const harness = await setup({ FAKE_CONSULT_CAPABILITIES: declared })
+    const capabilities = await harness.delegation.capabilities()
+    assert.equal(capabilities.canReport, false)
+    assert.equal(capabilities.canSteer, false)
+  })
+
+  it('refuses a build whose job envelopes it cannot read, before parsing one', async () => {
+    const declared = JSON.stringify({
+      schemaVersion: 1,
+      version: '2.0.0',
+      contracts: { jobResult: 2, events: 1, profiles: 1 },
+      features: { report: true, events: true, steer: true, reportExec: true, nativeReviewProfiles: [] },
+      bounds: {},
+    })
+    const harness = await setup({ FAKE_CONSULT_CAPABILITIES: declared })
+    const capabilities = await harness.delegation.capabilities()
+    assert.equal(capabilities.ready, false)
+    assert.match(capabilities.diagnosis ?? '', /job result schema 2/)
+    await assert.rejects(harness.delegation.delegate({ prompt: 'p' }), (error: unknown) =>
+      error instanceof DelegationError && error.code === 'not-ready')
+  })
+
+  it('degrades to the probes when the report is unreadable', async () => {
+    const harness = await setup({ FAKE_CONSULT_CAPABILITIES: '{"schemaVersion":99}' })
+    const capabilities = await harness.delegation.capabilities()
+    assert.equal(capabilities.ready, true, 'an unreadable self-description is not a reason to refuse')
+    assert.equal(capabilities.canSteer, true)
+    assert.equal(of(harness, 'steer').filter((run) => run.argv.includes('--help')).length, 1)
+  })
 })
 
 describe('exit-code mapping through a real spawn', () => {

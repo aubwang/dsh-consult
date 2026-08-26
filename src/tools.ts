@@ -31,6 +31,7 @@ import {
   type DelegationEvent,
   type DelegationJob,
   type DelegationResult,
+  type DelegationStatus,
   type ReviewSpec,
 } from './seam.ts'
 
@@ -483,6 +484,21 @@ export function apply(ctx: Context, config: Config = {}): void {
     })
   }
 
+  /**
+   * Whether a job has definitively finished. `unknown` is deliberately NOT
+   * finished: this decides whether to track a delegation for a completion
+   * notice, and a status this seam version does not model is far better
+   * tracked needlessly than dropped silently.
+   */
+  const isFinished = (status: DelegationStatus): boolean =>
+    status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'skipped'
+
+  /** What to tell a supervisor whose review already ran to completion in the call. */
+  const finishedReviewNote = (job: DelegationJob): string =>
+    `The review already finished (${job.status}) — this provider reviews in the foreground, so there is nothing to wait for `
+    + `and no completion notice will arrive. Read the findings with delegate_result ${job.id}, `
+    + `or the reviewer's transcript with delegate_logs ${job.id}.`
+
   const startedNote = (tracked: Tracking): string =>
     tracked.jobId === undefined
       ? `Not tracked as a background job (${tracked.reason ?? 'unknown reason'}), so no completion notice will arrive: `
@@ -603,15 +619,21 @@ export function apply(ctx: Context, config: Config = {}): void {
     },
     output: {
       schema: START_OUTPUT,
-      render: (_args, value) => [{
-        type: 'text',
-        text: value.kind === 'failure'
-          ? renderFailure(value.code, value.message, value.detail)
-          : `${jobLine(value.job as DelegationJob)}\n${startedNote({
-            ...value.backgroundJobId !== undefined ? { jobId: value.backgroundJobId } : {},
-            ...value.trackingNote !== undefined ? { reason: value.trackingNote } : {},
-          })}`,
-      }],
+      render: (_args, value) => {
+        if (value.kind === 'failure') {
+          return [{ type: 'text', text: renderFailure(value.code, value.message, value.detail) }]
+        }
+        const job = value.job as DelegationJob
+        return [{
+          type: 'text',
+          text: `${jobLine(job)}\n${isFinished(job.status)
+            ? finishedReviewNote(job)
+            : startedNote({
+              ...value.backgroundJobId !== undefined ? { jobId: value.backgroundJobId } : {},
+              ...value.trackingNote !== undefined ? { reason: value.trackingNote } : {},
+            })}`,
+        }]
+      },
     },
     async execute(args, exec) {
       const options = callOptions(exec)
@@ -642,6 +664,14 @@ export function apply(ctx: Context, config: Config = {}): void {
         job = await review(spec, options)
       } catch (error) {
         return toFailure(error)
+      }
+      // A provider with no queued review runs it in the foreground and hands
+      // back a job that is already terminal (seam: DelegationService.review).
+      // Registering a background collector for it would open a job, wait on a
+      // delegation that finished before the tool returned, and announce its
+      // completion as news — so the render points at the result instead.
+      if (isFinished(job.status)) {
+        return { kind: 'started' as const, job: jobValue(job) }
       }
       const tracked = track(job, exec, options, await steerable(options))
       return {
